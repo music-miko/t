@@ -28,7 +28,7 @@ LOGGER_ID = int(getenv("LOGGER_ID", None))
 MEDIA_CHANNEL_ID = int(getenv("MEDIA_CHANNEL_ID", None))
 
 # Get this value from @DazaiiRoBot on Telegram by /id
-OWNER_ID = int(getenv("OWNER_ID", 6848223695))
+OWNER_ID = int(getenv("OWNER_ID", 89891145))
 
 ## Fill these variables if you're deploying on heroku.
 # Your heroku app name
