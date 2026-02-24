@@ -33,7 +33,7 @@ import config
 from ..logging import LOGGER
 
 
-class Anony(Client):
+class damian(Client):
     def __init__(self):
         LOGGER(__name__).info("🛠️ Initializing DeadlineTech Bot...")
         super().__init__(
