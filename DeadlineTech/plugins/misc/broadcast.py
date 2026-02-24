@@ -4,7 +4,6 @@
 # ==========================================================
 
 import time
-import logging
 import asyncio
 
 from pyrogram import filters
@@ -25,20 +24,31 @@ from DeadlineTech.utils.decorators.language import language
 from DeadlineTech.utils.formatters import alpha_to_int
 from config import adminlist
 
-# Logger config
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - [%(levelname)s] - %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
-)
-logger = logging.getLogger("Broadcast")
+# --- Configuration & Constants ---
+from ..logging import LOGGER
+LOG = LOGGER(__name__)
 
 SEMAPHORE = asyncio.Semaphore(30)  # Increased concurrency
+
+# Custom Emoji Configuration
+class EMOJI:
+    INFO = '<emoji id="5258503720928288433">ℹ️</emoji>'
+    ERROR = '<emoji id="5210952531676504517">❌</emoji>'
+    WARN = '<emoji id="5447644880824181073">⚠️</emoji>'
+    STOP = '<emoji id="5440708482871361360">🚫</emoji>'
+    CHECK = '<emoji id="5208880351690112495">✅</emoji>'
+    BROADCAST = '<emoji id="5931641120458018914">📢</emoji>'
+    ARROW = '<emoji id="5371057809980943077">➡️</emoji>'
+    USER = '<emoji id="5258011929993026890">👤</emoji>'
+    CHATS = '<emoji id="5453957997418004470">👥</emoji>'
+    PACKAGE = '<emoji id="5463172695132745432">📦</emoji>'
+    TIMER = '<emoji id="5382194935057372936">⏱️</emoji>'
+    NOTE = '<emoji id="6039779802741739617">📝</emoji>'
 
 @app.on_message(filters.command("broadcast") & SUDOERS)
 async def broadcast_command(client, message: Message):
     try:
-        logger.info(f"/broadcast triggered by user: {message.from_user.id}")
+        LOG.info(f"/broadcast triggered by user: {message.from_user.id}")
 
         command = message.text.lower()
         mode = "forward" if "-forward" in command else "copy"
@@ -58,16 +68,16 @@ async def broadcast_command(client, message: Message):
             target_users = []
             target_chats = [c["chat_id"] for c in chats]
         else:
-            logger.warning("Incorrect broadcast format used.")
+            LOG.warning("Incorrect broadcast format used.")
             return await message.reply_text(
-                "❗ Usage:\n"
+                f"{EMOJI.WARN} <b>Usage:</b>\n"
                 "/broadcast -all/-users/-chats [-forward]\n"
-                "📝 Example: /broadcast -all Hello!"
+                f"{EMOJI.NOTE} <b>Example:</b> /broadcast -all Hello!"
             )
 
         if not target_users and not target_chats:
-            logger.info("No target recipients found.")
-            return await message.reply_text("⚠ No recipients found.")
+            LOG.info("No target recipients found.")
+            return await message.reply_text(f"{EMOJI.WARN} No recipients found.")
 
         # Extract content
         if message.reply_to_message:
@@ -79,7 +89,7 @@ async def broadcast_command(client, message: Message):
             text = text.strip()
 
             if not text:
-                return await message.reply_text("📝 Reply to a message or add content after the command.")
+                return await message.reply_text(f"{EMOJI.NOTE} Reply to a message or add content after the command.")
             content = text
 
         # Summary
@@ -88,16 +98,16 @@ async def broadcast_command(client, message: Message):
         sent_chats = 0
         failed = 0
 
-        logger.info(f"Broadcast mode: {mode}")
-        logger.info(f"Targets - Users: {len(target_users)}, Chats: {len(target_chats)}, Total: {total}")
+        LOG.info(f"Broadcast mode: {mode}")
+        LOG.info(f"Targets - Users: {len(target_users)}, Chats: {len(target_chats)}, Total: {total}")
 
         await message.reply_text(
-            f"📢 <b>Broadcast Started</b>\n\n"
-            f"➤ Mode: <code>{mode}</code>\n"
-            f"👤 Users: <code>{len(target_users)}</code>\n"
-            f"👥 Chats: <code>{len(target_chats)}</code>\n"
-            f"📦 Total: <code>{total}</code>\n"
-            f"⏳ Please wait while messages are being sent..."
+            f"{EMOJI.BROADCAST} <b>Broadcast Started</b>\n\n"
+            f"{EMOJI.ARROW} Mode: <code>{mode}</code>\n"
+            f"{EMOJI.USER} Users: <code>{len(target_users)}</code>\n"
+            f"{EMOJI.CHATS} Chats: <code>{len(target_chats)}</code>\n"
+            f"{EMOJI.PACKAGE} Total: <code>{total}</code>\n"
+            f"{EMOJI.TIMER} Please wait while messages are being sent..."
         )
 
         # Define delivery function
@@ -113,7 +123,7 @@ async def broadcast_command(client, message: Message):
                         try:
                             await content.copy(chat_id)
                         except Exception as e:
-                            logger.warning(f"Copy failed to {chat_id}: {e}")
+                            LOG.warning(f"Copy failed to {chat_id}: {e}")
                             failed += 1
                             return
 
@@ -124,18 +134,18 @@ async def broadcast_command(client, message: Message):
 
                 except FloodWait as e:
                     wait_time = min(e.value, 120)
-                    logger.warning(f"FloodWait {e.value}s in chat {chat_id}, waiting {wait_time}s")
+                    LOG.warning(f"FloodWait {e.value}s in chat {chat_id}, waiting {wait_time}s")
                     await asyncio.sleep(wait_time)
                     if retries > 0:
                         return await deliver(chat_id, is_user, retries - 1)
                     failed += 1
 
                 except RPCError as e:
-                    logger.warning(f"RPCError in chat {chat_id}: {e}")
+                    LOG.warning(f"RPCError in chat {chat_id}: {e}")
                     failed += 1
 
                 except Exception as e:
-                    logger.error(f"Error delivering to {chat_id}: {e}")
+                    LOG.error(f"Error delivering to {chat_id}: {e}")
                     failed += 1
 
         # Combine all targets
@@ -148,18 +158,18 @@ async def broadcast_command(client, message: Message):
 
         # Final summary
         await message.reply_text(
-            f"✅ <b>Broadcast Completed</b>\n\n"
-            f"➤ Mode: <code>{mode}</code>\n"
-            f"👤 Users Sent: <code>{sent_users}</code>\n"
-            f"👥 Chats Sent: <code>{sent_chats}</code>\n"
-            f"📦 Total Delivered: <code>{sent_users + sent_chats}</code>\n"
-            f"❌ Failed: <code>{failed}</code>"
+            f"{EMOJI.CHECK} <b>Broadcast Completed</b>\n\n"
+            f"{EMOJI.ARROW} Mode: <code>{mode}</code>\n"
+            f"{EMOJI.USER} Users Sent: <code>{sent_users}</code>\n"
+            f"{EMOJI.CHATS} Chats Sent: <code>{sent_chats}</code>\n"
+            f"{EMOJI.PACKAGE} Total Delivered: <code>{sent_users + sent_chats}</code>\n"
+            f"{EMOJI.ERROR} Failed: <code>{failed}</code>"
         )
-        logger.info(f"Broadcast finished. Success: {sent_users + sent_chats}, Failed: {failed}")
+        LOG.info(f"Broadcast finished. Success: {sent_users + sent_chats}, Failed: {failed}")
 
     except Exception as e:
-        logger.exception("Unhandled error in broadcast_command")
-        await message.reply_text(f"🚫 Broadcast failed: {str(e)}")
+        LOG.exception("Unhandled error in broadcast_command")
+        await message.reply_text(f"{EMOJI.STOP} Broadcast failed: {str(e)}")
 
 
 # Adminlist Auto-cleaner
@@ -181,4 +191,7 @@ async def auto_clean():
                     adminlist[chat_id].append(user_id)
 
         except Exception as e:
-            logger.warning(f"AutoClean error: {e}")
+            LOG.warning(f"AutoClean error: {e}")
+
+#auto clean task
+asyncio.create_task(auto_clean())
