@@ -1,5 +1,5 @@
 # Powered By Team DeadlineTech
-from DeadlineTech.core.bot import Anony
+from DeadlineTech.core.bot import damian
 from DeadlineTech.core.dir import dirr
 from DeadlineTech.core.git import git
 from DeadlineTech.core.userbot import Userbot
@@ -12,7 +12,7 @@ git()
 dbb()
 heroku()
 
-app = Anony()
+app = damian()
 userbot = Userbot()
 
 
