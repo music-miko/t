@@ -353,8 +353,30 @@ class YouTubeAPI:
         self.regex = r"(?:youtube\.com|youtu\.be)"
         self.listbase = "https://youtube.com/playlist?list="
 
+    # === SECURITY PATCH ===
+    def is_safe_youtube_url(self, url: str) -> bool:
+        """Validates that a URL is a legitimate YouTube link and contains no shell injection characters."""
+        if not url: return False
+        try:
+            p = urlparse(url)
+            if p.scheme not in ("http", "https"):
+                return False
+            allowed = ("youtube.com", "www.youtube.com", "m.youtube.com", "youtu.be")
+            if not any(domain in p.netloc for domain in allowed):
+                return False
+            # Block shell metacharacters and newlines
+            if any(x in url for x in [";", "|", "$", "`", "\n", "\r"]):
+                LOGGER.warning(f"⚠️ Blocked potentially malicious URL: {url}")
+                return False
+            return True
+        except Exception:
+            return False
+    # =======================
+
     async def exists(self, link: str, videoid: Union[bool, str] = None):
         if videoid: link = self.base + link
+        # Basic regex check is usually safe, but adding validation doesn't hurt
+        if not self.is_safe_youtube_url(link): return False
         return bool(re.search(self.regex, link))
 
     async def url(self, message: Message) -> Union[str, None]:
@@ -366,16 +388,19 @@ class YouTubeAPI:
             if msg.entities:
                 for entity in msg.entities:
                     if entity.type == MessageEntityType.URL:
-                        return text[entity.offset:entity.offset+entity.length]
+                        u = text[entity.offset:entity.offset+entity.length]
+                        if self.is_safe_youtube_url(u): return u
             if msg.caption_entities:
                 for entity in msg.caption_entities:
                     if entity.type == MessageEntityType.TEXT_LINK:
-                        return entity.url
+                        if self.is_safe_youtube_url(entity.url): return entity.url
         return None
 
     # Metadata methods use VideosSearch (kept as requested)
     async def details(self, link: str, videoid: Union[bool, str] = None):
         if videoid: link = self.base + link
+        if not self.is_safe_youtube_url(link): return None # Validation Check
+        
         if "&" in link: link = link.split("&")[0]
         results = VideosSearch(link, limit=1)
         for r in (await results.next())["result"]:
@@ -385,24 +410,32 @@ class YouTubeAPI:
 
     async def title(self, link: str, videoid: Union[bool, str] = None):
         if videoid: link = self.base + link
+        if not self.is_safe_youtube_url(link): return "" # Validation Check
+        
         results = VideosSearch(link, limit=1)
         for r in (await results.next())["result"]: return r["title"]
         return ""
 
     async def duration(self, link: str, videoid: Union[bool, str] = None):
         if videoid: link = self.base + link
+        if not self.is_safe_youtube_url(link): return "00:00" # Validation Check
+        
         results = VideosSearch(link, limit=1)
         for r in (await results.next())["result"]: return r["duration"]
         return "00:00"
 
     async def thumbnail(self, link: str, videoid: Union[bool, str] = None):
         if videoid: link = self.base + link
+        if not self.is_safe_youtube_url(link): return "" # Validation Check
+        
         results = VideosSearch(link, limit=1)
         for r in (await results.next())["result"]: return r["thumbnails"][0]["url"].split("?")[0]
         return ""
 
     async def track(self, link: str, videoid: Union[bool, str] = None):
         if videoid: link = self.base + link
+        if not self.is_safe_youtube_url(link): return None, None # Validation Check
+        
         results = VideosSearch(link, limit=1)
         for r in (await results.next())["result"]:
             return {
@@ -413,6 +446,8 @@ class YouTubeAPI:
 
     async def slider(self, link: str, query_type: int, videoid: Union[bool, str] = None):
         if videoid: link = self.base + link
+        if not self.is_safe_youtube_url(link): return None # Validation Check
+        
         a = VideosSearch(link, limit=10)
         result = (await a.next()).get("result")
         if not result or query_type >= len(result): return None
@@ -422,7 +457,8 @@ class YouTubeAPI:
     # === NEW: Replaced Video Method ===
     async def video(self, link: str, videoid: Union[bool, str] = None):
         if videoid: link = self.base + link
-        
+        if not self.is_safe_youtube_url(link): return 0, "Invalid or Unsafe URL" # Validation Check
+
         # Internal runner to fit download signature
         async def _run():
             vid = extract_video_id(link)
@@ -451,6 +487,7 @@ class YouTubeAPI:
     ) -> str:
         _inc("total")
         if videoid: link = self.base + link
+        if not self.is_safe_youtube_url(link): return None, None # Validation Check
         
         is_vid = True if (video or songvideo) else False
         vid = extract_video_id(link)
