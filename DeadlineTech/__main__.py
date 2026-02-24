@@ -9,7 +9,7 @@ from pytgcalls.exceptions import NoActiveGroupCall
 
 import config
 from DeadlineTech import LOGGER, app, userbot
-from DeadlineTech.core.call import Anony
+from DeadlineTech.core.call import damian
 from DeadlineTech.misc import sudo
 from DeadlineTech.plugins import ALL_MODULES
 from DeadlineTech.utils.database import get_banned_users, get_gbanned
@@ -75,9 +75,9 @@ async def init():
         importlib.import_module("DeadlineTech.plugins" + all_module)
     LOGGER("DeadlineTech.plugins").info("Successfully Imported Modules...")
     await userbot.start()
-    await Anony.start()
+    await damian.start()
     try:
-        await Anony.stream_call("https://te.legra.ph/file/29f784eb49d230ab62e9e.mp4")
+        await damian.stream_call("https://te.legra.ph/file/29f784eb49d230ab62e9e.mp4")
     except NoActiveGroupCall:
         LOGGER("DeadlineTech").error(
             "Please turn on the videochat of your log group\channel.\n\nStopping Bot..."
@@ -85,7 +85,7 @@ async def init():
         exit()
     except:
         pass
-    await Anony.decorators()
+    await damian.decorators()
     LOGGER("DeadlineTech").info(
         "DeadlineTech Music Bot started successfully"
     )
