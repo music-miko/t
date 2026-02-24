@@ -60,13 +60,19 @@ _session: Optional[aiohttp.ClientSession] = None
 _session_lock = asyncio.Lock()
 _MONGO_CLIENT: Optional[AsyncIOMotorClient] = None
 
-LOGGER = logging.getLogger(__name__)
+# Configure Logger
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+)
+LOGGER = logging.getLogger("YouTubeAPI")
 
 # === Statistics System ===
 DOWNLOAD_STATS: Dict[str, int] = {
     "total": 0, "success": 0, "failed": 0,
     "media_db_hit": 0, "media_db_miss": 0, "media_db_fail": 0,
-    "api_fail_5xx": 0, "network_fail": 0, "timeout_fail": 0
+    "api_fail_5xx": 0, "network_fail": 0, "timeout_fail": 0,
+    "blocked_unsafe": 0
 }
 
 def _inc(key: str):
@@ -171,6 +177,7 @@ async def _download_from_media_db(track_id: str, is_video: bool) -> Optional[str
         _inc("media_db_miss")
         return None
 
+    LOGGER.info(f"📂 Database HIT: Found {track_id} in cache. Downloading from Telegram...")
     _inc("media_db_hit")
     out_dir = str(Path(DOWNLOAD_DIR))
     _ensure_dir(out_dir)
@@ -195,12 +202,14 @@ async def _download_from_media_db(track_id: str, is_video: bool) -> Optional[str
             if fixed != final_path:
                 try: os.replace(fixed, final_path)
                 except: final_path = fixed
+            LOGGER.info(f"✅ Database Download Success: {final_path}")
             return final_path
             
     except FloodWait as e:
         TG_FLOOD_COOLDOWN = time.time() + e.value + 5
-        print(f"⚠️ FloodWait: {e.value}s")
-    except Exception:
+        LOGGER.warning(f"⚠️ Telegram FloodWait: Sleeping for {e.value}s")
+    except Exception as e:
+        LOGGER.error(f"❌ Database Download Failed: {e}")
         _inc("media_db_fail")
     
     return None
@@ -236,11 +245,13 @@ def _normalize_candidate_to_url(candidate: str) -> Optional[str]:
 async def _download_from_cdn(cdn_url: str, out_path: str) -> Optional[str]:
     if not cdn_url: return None
     
+    LOGGER.info(f"⬇️ CDN Download started: {out_path}")
     for attempt in range(1, CDN_RETRIES + 1):
         try:
             session = await get_http_session()
             async with session.get(cdn_url, timeout=HARD_TIMEOUT) as resp:
                 if resp.status != 200:
+                    LOGGER.warning(f"⚠️ CDN HTTP {resp.status} (Attempt {attempt}/{CDN_RETRIES})")
                     if attempt < CDN_RETRIES:
                         await asyncio.sleep(CDN_RETRY_DELAY)
                         continue
@@ -253,8 +264,10 @@ async def _download_from_cdn(cdn_url: str, out_path: str) -> Optional[str]:
                         await f.write(chunk)
             
             if os.path.exists(out_path) and os.path.getsize(out_path) > 0:
+                LOGGER.info(f"✅ CDN Download Complete: {out_path}")
                 return out_path
-        except Exception:
+        except Exception as e:
+            LOGGER.error(f"❌ CDN Network Fail: {e}")
             _inc("network_fail")
             if attempt < CDN_RETRIES: await asyncio.sleep(CDN_RETRY_DELAY)
     return None
@@ -273,7 +286,9 @@ async def _v2_request_json(endpoint: str, params: Dict[str, Any]) -> Optional[An
                 if 200 <= resp.status < 300:
                     try: return await resp.json()
                     except: return None
-                if resp.status in (401, 403): raise V2HardAPIError(resp.status)
+                if resp.status in (401, 403): 
+                    LOGGER.critical(f"⛔ API Auth Error: {resp.status}")
+                    raise V2HardAPIError(resp.status)
                 if resp.status >= 500: _inc("api_fail_5xx")
                 else: _inc("network_fail")
         except V2HardAPIError: raise
@@ -291,6 +306,8 @@ async def v2_download_process(link: str, video: bool) -> Optional[str]:
     
     if os.path.exists(out_path): return out_path
 
+    LOGGER.info(f"🔄 Starting V2 API Process for: {query}")
+
     for cycle in range(1, V2_DOWNLOAD_CYCLES + 1):
         try:
             resp = await _v2_request_json("youtube/v2/download", {"query": query, "isVideo": str(video).lower()})
@@ -306,6 +323,7 @@ async def v2_download_process(link: str, video: bool) -> Optional[str]:
         job_id = resp.get("job_id") if isinstance(resp, dict) else None
         
         if job_id and not candidate:
+            LOGGER.info(f"⏳ Job queued (ID: {job_id}), polling status...")
             interval = JOB_POLL_INTERVAL
             for _ in range(JOB_POLL_ATTEMPTS):
                 await asyncio.sleep(interval)
@@ -323,6 +341,7 @@ async def v2_download_process(link: str, video: bool) -> Optional[str]:
             path = await _download_from_cdn(final_url, out_path)
             if path: return path
 
+    LOGGER.error(f"❌ V2 Process Failed after {V2_DOWNLOAD_CYCLES} cycles.")
     return None
 
 # === De-duplication ===
@@ -330,6 +349,7 @@ async def v2_download_process(link: str, video: bool) -> Optional[str]:
 async def deduplicate_download(key: str, runner):
     async with _inflight_lock:
         if fut := _inflight.get(key):
+            LOGGER.info(f"🔗 Joining existing download for: {key}")
             return await fut
         fut = asyncio.get_running_loop().create_future()
         _inflight[key] = fut
@@ -338,6 +358,7 @@ async def deduplicate_download(key: str, runner):
         if not fut.done(): fut.set_result(result)
         return result
     except Exception as e:
+        LOGGER.error(f"💥 Exception in download runner: {e}")
         if not fut.done(): fut.set_exception(e)
         return None
     finally:
@@ -365,6 +386,8 @@ class YouTubeAPI:
         
         # 1. Always Block Shell Injection Chars
         if any(x in text for x in [";", "|", "$", "`", "\n", "\r"]):
+            _inc("blocked_unsafe")
+            LOGGER.warning(f"🛡️ Blocked Shell Injection Attempt: {text}")
             return False
 
         # 2. Domain Check (Only if it looks like a URL)
@@ -373,11 +396,11 @@ class YouTubeAPI:
                 p = urlparse(text)
                 allowed = ("youtube.com", "www.youtube.com", "m.youtube.com", "youtu.be")
                 if not any(domain in p.netloc for domain in allowed):
+                    LOGGER.warning(f"🛡️ Blocked Non-YouTube URL: {text}")
                     return False
             except:
                 return False
         
-        # 3. Allow clean search terms
         return True
     # ======================================
 
@@ -403,40 +426,48 @@ class YouTubeAPI:
                         if self.is_safe_input(entity.url): return entity.url
         return None
 
-    # Metadata methods use VideosSearch (kept as requested)
     async def details(self, link: str, videoid: Union[bool, str] = None):
         if videoid: link = self.base + link
         if not self.is_safe_input(link): return None
         
         if "&" in link: link = link.split("&")[0]
-        results = VideosSearch(link, limit=1)
-        for r in (await results.next())["result"]:
-            sec = int(time_to_seconds(r["duration"])) if r["duration"] else 0
-            return r["title"], r["duration"], sec, r["thumbnails"][0]["url"].split("?")[0], r["id"]
+        try:
+            results = VideosSearch(link, limit=1)
+            for r in (await results.next())["result"]:
+                sec = int(time_to_seconds(r["duration"])) if r["duration"] else 0
+                return r["title"], r["duration"], sec, r["thumbnails"][0]["url"].split("?")[0], r["id"]
+        except Exception as e:
+            LOGGER.error(f"❌ Details fetch failed for {link}: {e}")
         return None
 
     async def title(self, link: str, videoid: Union[bool, str] = None):
         if videoid: link = self.base + link
         if not self.is_safe_input(link): return ""
         
-        results = VideosSearch(link, limit=1)
-        for r in (await results.next())["result"]: return r["title"]
+        try:
+            results = VideosSearch(link, limit=1)
+            for r in (await results.next())["result"]: return r["title"]
+        except: pass
         return ""
 
     async def duration(self, link: str, videoid: Union[bool, str] = None):
         if videoid: link = self.base + link
         if not self.is_safe_input(link): return "00:00"
         
-        results = VideosSearch(link, limit=1)
-        for r in (await results.next())["result"]: return r["duration"]
+        try:
+            results = VideosSearch(link, limit=1)
+            for r in (await results.next())["result"]: return r["duration"]
+        except: pass
         return "00:00"
 
     async def thumbnail(self, link: str, videoid: Union[bool, str] = None):
         if videoid: link = self.base + link
         if not self.is_safe_input(link): return ""
         
-        results = VideosSearch(link, limit=1)
-        for r in (await results.next())["result"]: return r["thumbnails"][0]["url"].split("?")[0]
+        try:
+            results = VideosSearch(link, limit=1)
+            for r in (await results.next())["result"]: return r["thumbnails"][0]["url"].split("?")[0]
+        except: pass
         return ""
 
     async def track(self, link: str, videoid: Union[bool, str] = None):
@@ -454,7 +485,7 @@ class YouTubeAPI:
                     "duration_min": r["duration"], "thumb": r["thumbnails"][0]["url"].split("?")[0],
                 }, r["id"]
         except Exception as e:
-            LOGGER.error(f"Track search error: {e}")
+            LOGGER.error(f"❌ Track search error: {e}")
             return None, None
             
         return None, None
@@ -463,18 +494,21 @@ class YouTubeAPI:
         if videoid: link = self.base + link
         if not self.is_safe_input(link): return None
         
-        a = VideosSearch(link, limit=10)
-        result = (await a.next()).get("result")
-        if not result or query_type >= len(result): return None
-        r = result[query_type]
-        return r["title"], r["duration"], r["thumbnails"][0]["url"].split("?")[0], r["id"]
+        try:
+            a = VideosSearch(link, limit=10)
+            result = (await a.next()).get("result")
+            if not result or query_type >= len(result): return None
+            r = result[query_type]
+            return r["title"], r["duration"], r["thumbnails"][0]["url"].split("?")[0], r["id"]
+        except: return None
 
     # === NEW: Replaced Video Method ===
     async def video(self, link: str, videoid: Union[bool, str] = None):
         if videoid: link = self.base + link
         if not self.is_safe_input(link): return 0, "Invalid or Unsafe Input"
 
-        # Internal runner to fit download signature
+        LOGGER.info(f"📹 Video Download Requested: {link}")
+
         async def _run():
             vid = extract_video_id(link)
             if vid:
@@ -509,6 +543,8 @@ class YouTubeAPI:
         dedup_id = vid or link
         key = f"{'video' if is_vid else 'audio'}:{dedup_id}"
         
+        LOGGER.info(f"📥 Download Request: {dedup_id} (Video={is_vid})")
+
         async def _download_logic():
             # 1. DB Check
             if vid:
@@ -535,6 +571,6 @@ class YouTubeAPI:
             if path: return path, True
         except Exception as e:
             _inc("timeout_fail")
-            print(f"Download Timeout/Error: {e}")
+            LOGGER.error(f"❌ Download Timed Out/Error: {e}")
 
         return None, None
