@@ -11,6 +11,7 @@ import yt_dlp
 
 from pathlib import Path
 from typing import Union, Optional, Dict, Any, List
+from urllib.parse import urlparse
 
 from motor.motor_asyncio import AsyncIOMotorClient
 from aiohttp import TCPConnector
@@ -19,7 +20,7 @@ from pyrogram.types import Message
 from pyrogram.enums import MessageEntityType
 from pyrogram.errors import FloodWait
 
-# --- NEW LIBRARY ---
+# --- CORRECTION: USING py_yt INSTEAD OF youtubesearchpython ---
 from py_yt import VideosSearch, Playlist
 
 from DeadlineTech import app as TG_APP
@@ -104,6 +105,15 @@ def cookie_txt_file():
     if not os.path.exists(cookie_dir): return None
     files = [f for f in os.listdir(cookie_dir) if f.endswith(".txt")]
     return os.path.join(cookie_dir, random.choice(files)) if files else None
+
+def sec_to_min(sec):
+    """Converts seconds (int) to MM:SS string."""
+    try:
+        sec = int(sec)
+        m, s = divmod(sec, 60)
+        return f"{m:02d}:{s:02d}"
+    except:
+        return "00:00"
 
 def _ensure_dir(p: str) -> None:
     os.makedirs(p, exist_ok=True)
@@ -212,7 +222,7 @@ async def _download_from_media_db(track_id: str, is_video: bool) -> Optional[str
     
     return None
 
-# === V2 API Helpers ===
+# === V2 API Helpers (Downloads) ===
 
 def _extract_candidate(obj: Any) -> Optional[str]:
     if not obj: return None
@@ -363,6 +373,24 @@ class YouTubeAPI:
         self.regex = r"(?:youtube\.com|youtu\.be)"
         self.listbase = "https://youtube.com/playlist?list="
 
+    # === FALLBACK API HELPER ===
+    async def _search_api(self, query: str):
+        """Fallback: Fetches video metadata from DeadlineTech API."""
+        try:
+            session = await get_http_session()
+            base = API_URL.rstrip('/')
+            url = f"{base}/youtube/search"
+            params = {"query": query, "api_key": API_KEY}
+            
+            async with session.get(url, params=params) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    if data.get("status") == "success" and data.get("result"):
+                        return data["result"]
+        except Exception as e:
+            LOGGER.error(f"⚠️ Metadata API Error: {e}")
+        return None
+
     async def exists(self, link: str, videoid: Union[bool, str] = None):
         if videoid: link = self.base + link
         return bool(re.search(self.regex, link))
@@ -383,126 +411,156 @@ class YouTubeAPI:
                         return entity.url
         return None
 
+    # --- METADATA (Includes API Fallback) ---
     async def details(self, link: str, videoid: Union[bool, str] = None):
         if videoid: link = self.base + link
         if "&" in link: link = link.split("&")[0]
+        
+        # 1. Try Local py_yt
         try:
             results = VideosSearch(link, limit=1)
-            for r in (await results.next())["result"]:
-                sec = int(time_to_seconds(r["duration"])) if r["duration"] else 0
-                return r["title"], r["duration"], sec, r["thumbnails"][0]["url"].split("?")[0], r["id"]
-        except: pass
+            res = await results.next()
+            if res and "result" in res:
+                for r in res["result"]:
+                    sec = int(time_to_seconds(r["duration"])) if r.get("duration") else 0
+                    thumb = r.get("thumbnails", [{}])[0].get("url", "").split("?")[0]
+                    return r["title"], r["duration"], sec, thumb, r["id"]
+        except Exception:
+            pass # Fallback
+            
+        # 2. Try Fallback API
+        res = await self._search_api(link)
+        if res:
+            title = res.get("title", "Unknown")
+            duration_sec = int(res.get("duration", 0))
+            duration_str = sec_to_min(duration_sec)
+            thumb = res.get("thumbnail", "")
+            vid_url = res.get("url", "")
+            vidid = extract_video_id(vid_url)
+            return title, duration_str, duration_sec, thumb, vidid
+            
         return None
 
     async def title(self, link: str, videoid: Union[bool, str] = None):
         if videoid: link = self.base + link
+        
         try:
             results = VideosSearch(link, limit=1)
-            for r in (await results.next())["result"]: return r["title"]
+            res = await results.next()
+            for r in res.get("result", []): return r["title"]
         except: pass
+        
+        # Fallback
+        res = await self._search_api(link)
+        if res: return res.get("title", "")
         return ""
 
     async def duration(self, link: str, videoid: Union[bool, str] = None):
         if videoid: link = self.base + link
+        
         try:
             results = VideosSearch(link, limit=1)
-            for r in (await results.next())["result"]: return r["duration"]
+            res = await results.next()
+            for r in res.get("result", []): return r["duration"]
         except: pass
+        
+        # Fallback
+        res = await self._search_api(link)
+        if res: return sec_to_min(res.get("duration", 0))
         return "00:00"
 
     async def thumbnail(self, link: str, videoid: Union[bool, str] = None):
         if videoid: link = self.base + link
+        
         try:
             results = VideosSearch(link, limit=1)
-            for r in (await results.next())["result"]: return r["thumbnails"][0]["url"].split("?")[0]
+            res = await results.next()
+            for r in res.get("result", []): 
+                 return r.get("thumbnails", [{}])[0].get("url", "").split("?")[0]
         except: pass
+        
+        # Fallback
+        res = await self._search_api(link)
+        if res: return res.get("thumbnail", "")
         return ""
 
     async def track(self, link: str, videoid: Union[bool, str] = None):
         if videoid: link = self.base + link
+        if "&" in link: link = link.split("&")[0]
+        
+        # 1. Try Local
         try:
             results = VideosSearch(link, limit=1)
-            res_list = (await results.next())["result"]
-            if not res_list: return None, None
-            for r in res_list:
-                return {
-                    "title": r["title"], "link": r["link"], "vidid": r["id"],
-                    "duration_min": r["duration"], "thumb": r["thumbnails"][0]["url"].split("?")[0],
-                }, r["id"]
+            res = await results.next()
+            if res and "result" in res:
+                for r in res["result"]:
+                    thumb = r.get("thumbnails", [{}])[0].get("url", "").split("?")[0]
+                    return {
+                        "title": r.get("title"), "link": r.get("link"), "vidid": r.get("id"),
+                        "duration_min": r.get("duration"), "thumb": thumb,
+                    }, r.get("id")
         except: pass
+        
+        # 2. Fallback
+        res = await self._search_api(link)
+        if res:
+            title = res.get("title", "Unknown")
+            vid_url = res.get("url", "")
+            vidid = extract_video_id(vid_url)
+            duration_sec = int(res.get("duration", 0))
+            duration_str = sec_to_min(duration_sec)
+            thumb = res.get("thumbnail", "")
+            
+            return {
+                "title": title, "link": vid_url, "vidid": vidid,
+                "duration_min": duration_str, "thumb": thumb,
+            }, vidid
+            
         return None, None
 
     async def slider(self, link: str, query_type: int, videoid: Union[bool, str] = None):
         if videoid: link = self.base + link
+        
+        # 1. Try Local
         try:
             a = VideosSearch(link, limit=10)
-            result = (await a.next()).get("result")
-            if not result or query_type >= len(result): return None
+            res = await a.next()
+            result = res.get("result")
+            if not result or query_type >= len(result): 
+                if query_type == 0 and not result: raise Exception("Empty")
+                return None
+            
             r = result[query_type]
-            return r["title"], r["duration"], r["thumbnails"][0]["url"].split("?")[0], r["id"]
-        except: return None
+            thumb = r.get("thumbnails", [{}])[0].get("url", "").split("?")[0]
+            return r["title"], r["duration"], thumb, r["id"]
+        except: pass
+        
+        # 2. Fallback (Only works for first result / index 0)
+        if query_type == 0:
+            res = await self._search_api(link)
+            if res:
+                title = res.get("title", "Unknown")
+                duration_sec = int(res.get("duration", 0))
+                duration_str = sec_to_min(duration_sec)
+                thumb = res.get("thumbnail", "")
+                vid_url = res.get("url", "")
+                vidid = extract_video_id(vid_url)
+                return title, duration_str, thumb, vidid
+        
+        return None
 
-    # === PLAYLIST METHOD USING PY_YT ===
     async def playlist(self, link, limit, user_id, videoid: Union[bool, str] = None):
         if videoid: link = self.listbase + link
+        
+        # Use py_yt Playlist (no API fallback for playlist items currently)
         try:
             plist = await Playlist.get(link)
-        except:
-            return []
-            
-        videos = plist.get("videos") or []
-        ids: list[str] = []
-        for data in videos[:limit]:
-            if not data:
-                continue
-            vid = data.get("id")
-            if not vid:
-                continue
-            ids.append(vid)
-        return ids
-
-    # === VIDEO METHOD (Includes Fallback) ===
-    async def video(self, link: str, videoid: Union[bool, str] = None):
-        if videoid: link = self.base + link
-
-        LOGGER.info(f"📹 Video Req: {link}")
-
-        async def _run():
-            vid = extract_video_id(link)
-            
-            # 1. DB
-            if vid:
-                db_path = await _download_from_media_db(vid, is_video=True)
-                if db_path: return 1, db_path
-            
-            # 2. V2 API
-            path = await v2_download_process(link, video=True)
-            if path: 
-                _inc("v2_success")
-                return 1, path
-            
-            # 3. Cookie Fallback (Safety Logic)
-            LOGGER.info("🍪 Fallback: Using yt-dlp cookies")
-            cookie_file = cookie_txt_file()
-            if not cookie_file: return 0, "No cookies/API failed"
-            
-            cmd = ["yt-dlp", "--cookies", cookie_file, "-g", "-f", "best[height<=?720]", "--", link]
-            try:
-                # SAFE: subprocess_exec prevents command injection completely
-                proc = await asyncio.create_subprocess_exec(
-                    *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
-                )
-                stdout, stderr = await proc.communicate()
-                if stdout: 
-                    _inc("cookie_success")
-                    return 1, stdout.decode().split("\n")[0]
-            except Exception as e:
-                LOGGER.error(f"Fallback error: {e}")
-
-            return 0, "Failed"
-
-        key = f"video:{link}"
-        return await deduplicate_download(key, _run)
+            if not plist or "videos" not in plist: return []
+            ids = []
+            for data in plist["videos"][:limit]:
+                if data.get("id"): ids.append(data["id"])
+            return ids
+        except: return []
 
     async def formats(self, link: str, videoid: Union[bool, str] = None):
         if videoid: link = self.base + link
@@ -524,7 +582,7 @@ class YouTubeAPI:
         except: pass
         return out, link
 
-    # === DOWNLOAD METHOD (Includes Fallback) ===
+    # === DOWNLOAD METHOD (Robust 3-Layer) ===
     async def download(
         self,
         link: str,
@@ -570,7 +628,6 @@ class YouTubeAPI:
             
             loop = asyncio.get_running_loop()
             def _legacy_dl():
-                # SAFE: using yt_dlp's native Python API avoids shell command injection
                 opts = {
                     "format": "bestaudio/best" if not is_vid else "(bestvideo+bestaudio)",
                     "outtmpl": "downloads/%(id)s.%(ext)s", "quiet": True, 
