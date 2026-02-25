@@ -4,9 +4,10 @@ import random
 import aiohttp
 import aiofiles
 import traceback
+import config
 
 from PIL import Image, ImageDraw, ImageEnhance, ImageFilter, ImageFont, ImageOps
-from youtubesearchpython.__future__ import VideosSearch
+from py_yt import VideosSearch
 
 
 def changeImageSize(maxWidth, maxHeight, image):
@@ -53,6 +54,7 @@ def fit_text(draw, text, max_width, font_path, start_size, min_size):
 async def get_thumb(videoid: str):
     url = f"https://www.youtube.com/watch?v={videoid}"
     try:
+        # Changed to py_yt VideosSearch
         results = VideosSearch(url, limit=1)
         for result in (await results.next())["result"]:
             title = re.sub(r"\W+", " ", result.get("title", "Unsupported Title")).title()
@@ -141,5 +143,5 @@ async def get_thumb(videoid: str):
         return tpath
 
     except:
-        traceback.print_exc()
-        return None
+        # Fallback to config URL if generation fails
+        return config.YOUTUBE_IMG_URL
