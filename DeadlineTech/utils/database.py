@@ -25,6 +25,7 @@ playtypedb = mongodb.playtypedb
 skipdb = mongodb.skipmode
 sudoersdb = mongodb.sudoers
 usersdb = mongodb.tgusersdb
+statsdb = mongodb.bot_stats
 
 # Shifting to memory [mongo sucks often]
 active = []
