@@ -1,147 +1,209 @@
 import os
 import re
-import random
 import aiohttp
 import aiofiles
+import textwrap
 import traceback
-import config
+import asyncio
+from PIL import (
+    Image,
+    ImageDraw,
+    ImageEnhance,
+    ImageFilter,
+    ImageFont,
+    ImageOps,
+    ImageChops
+)
+from youtubesearchpython.__future__ import VideosSearch
+import config  # Ensure this imports your config file where YOUTUBE_IMG_URL is defined
 
-from PIL import Image, ImageDraw, ImageEnhance, ImageFilter, ImageFont, ImageOps
-from py_yt import VideosSearch
+# --- Constants & Helpers ---
 
+# Handle Pillow version differences for Resampling
+RESAMPLE_FILTER = getattr(Image, "Resampling", Image).LANCZOS
 
-def changeImageSize(maxWidth, maxHeight, image):
-    ratio = min(maxWidth / image.size[0], maxHeight / image.size[1])
-    newSize = (int(image.size[0] * ratio), int(image.size[1] * ratio))
-    return image.resize(newSize, Image.ANTIALIAS)
+def make_col():
+    """Generate a consistent pastel color for accents."""
+    return (255, 255, 255)  # Clean White for modern look, or use random if preferred
 
+def truncate(text, limit):
+    """Smartly truncate text to a limit."""
+    if len(text) > limit:
+        return text[:limit] + "..."
+    return text
 
-def truncate(text, max_chars=50):
-    words = text.split()
-    text1, text2 = "", ""
-    for word in words:
-        if len(text1 + " " + word) <= max_chars and not text2:
-            text1 += " " + word
-        else:
-            text2 += " " + word
-    return [text1.strip(), text2.strip()]
-
-
-def add_rounded_corners(im, radius):
-    circle = Image.new('L', (radius * 2, radius * 2), 0)
+def add_corners(im, rad):
+    """Adds rounded corners to an image."""
+    circle = Image.new('L', (rad * 2, rad * 2), 0)
     draw = ImageDraw.Draw(circle)
-    draw.ellipse((0, 0, radius * 2, radius * 2), fill=255)
+    draw.ellipse((0, 0, rad * 2, rad * 2), fill=255)
     alpha = Image.new('L', im.size, 255)
     w, h = im.size
-    alpha.paste(circle.crop((0, 0, radius, radius)), (0, 0))
-    alpha.paste(circle.crop((0, radius, radius, radius * 2)), (0, h - radius))
-    alpha.paste(circle.crop((radius, 0, radius * 2, radius)), (w - radius, 0))
-    alpha.paste(circle.crop((radius, radius, radius * 2, radius * 2)), (w - radius, h - radius))
+    alpha.paste(circle.crop((0, 0, rad, rad)), (0, 0))
+    alpha.paste(circle.crop((0, rad, rad, rad * 2)), (0, h - rad))
+    alpha.paste(circle.crop((rad, 0, rad * 2, rad)), (w - rad, 0))
+    alpha.paste(circle.crop((rad, rad, rad * 2, rad * 2)), (w - rad, h - rad))
     im.putalpha(alpha)
     return im
 
+async def download_image(url, filename):
+    async with aiohttp.ClientSession() as session:
+        async with session.get(url) as resp:
+            if resp.status == 200:
+                f = await aiofiles.open(filename, mode="wb")
+                await f.write(await resp.read())
+                await f.close()
+                return True
+    return False
 
-def fit_text(draw, text, max_width, font_path, start_size, min_size):
-    size = start_size
-    while size >= min_size:
-        font = ImageFont.truetype(font_path, size)
-        if draw.textlength(text, font=font) <= max_width:
-            return font
-        size -= 1
-    return ImageFont.truetype(font_path, min_size)
-
+# --- Main Function ---
 
 async def get_thumb(videoid: str):
+    """
+    Generates a custom thumbnail.
+    Returns local path on success, or config.YOUTUBE_IMG_URL on failure.
+    """
+    if os.path.isfile(f"cache/{videoid}.png"):
+        return f"cache/{videoid}.png"
+
     url = f"https://www.youtube.com/watch?v={videoid}"
+    temp_thumb_path = f"cache/temp{videoid}.png"
+    final_thumb_path = f"cache/{videoid}.png"
+
     try:
-        # Changed to py_yt VideosSearch
+        # 1. Fetch Details
         results = VideosSearch(url, limit=1)
-        for result in (await results.next())["result"]:
-            title = re.sub(r"\W+", " ", result.get("title", "Unsupported Title")).title()
-            duration = result.get("duration", "Unknown Mins")
-            thumbnail = result["thumbnails"][0]["url"].split("?")[0]
-            views = result.get("viewCount", {}).get("short", "Unknown Views")
-            channel = result.get("channel", {}).get("name", "Unknown Channel")
+        res_json = await results.next()
+        if not res_json["result"]:
+            raise Exception("No video results found")
+            
+        result = res_json["result"][0]
+        
+        title = result.get("title", "Unknown Title")
+        title = re.sub(r"\W+", " ", title).title()
+        duration = result.get("duration", "Live")
+        thumbnail_url = result["thumbnails"][0]["url"].split("?")[0]
+        views = result.get("viewCount", {}).get("short", "Unknown Views")
+        channel = result.get("channel", {}).get("name", "Unknown Channel")
 
-        async with aiohttp.ClientSession() as session:
-            async with session.get(thumbnail) as resp:
-                if resp.status == 200:
-                    f = await aiofiles.open(f"cache/thumb{videoid}.png", mode="wb")
-                    await f.write(await resp.read())
-                    await f.close()
+        # 2. Download Thumbnail
+        success = await download_image(thumbnail_url, temp_thumb_path)
+        if not success:
+            raise Exception("Failed to download thumbnail")
 
-        icons = Image.open("DeadlineTech/assets/icons.png")
-        youtube = Image.open(f"cache/thumb{videoid}.png")
-        image1 = changeImageSize(1280, 720, youtube)
+        # 3. Process Image
+        # Load Assets (Wrap in try block to fallback if missing)
+        youtube = Image.open(temp_thumb_path)
+        
+        # Create Canvas (1280x720)
+        image1 = ImageOps.fit(youtube, (1280, 720), centering=(0.5, 0.5))
         image2 = image1.convert("RGBA")
 
-        gradient = Image.new("RGBA", image2.size, (0, 0, 0, 255))
-        enhancer = ImageEnhance.Brightness(image2.filter(ImageFilter.GaussianBlur(15)))
-        blurred = enhancer.enhance(0.5)
-        background = Image.alpha_composite(gradient, blurred)
+        # -- Background Layer --
+        # Blur and Darken
+        background = image2.filter(ImageFilter.GaussianBlur(20))
+        enhancer = ImageEnhance.Brightness(background)
+        background = enhancer.enhance(0.6) # Darken background by 40%
 
-        Xcenter = image2.width / 2
-        Ycenter = image2.height / 2
-        logo = youtube.crop((Xcenter - 200, Ycenter - 200, Xcenter + 200, Ycenter + 200))
-        logo.thumbnail((340, 340), Image.ANTIALIAS)
+        # Add a dark overlay for better text contrast
+        overlay = Image.new("RGBA", background.size, (0, 0, 0, 120))
+        background = Image.alpha_composite(background, overlay)
 
-        shadow = Image.new("RGBA", logo.size, (0, 0, 0, 0))
-        shadow_draw = ImageDraw.Draw(shadow)
-        shadow_draw.ellipse((0, 0, logo.size[0], logo.size[1]), fill=(0, 0, 0, 100))
-        background.paste(shadow, (110, 160), shadow)
+        # -- Main Art Layer (Left Side) --
+        # Resize original thumb to a nice square
+        art_size = (450, 450)
+        art = ImageOps.fit(youtube, art_size, centering=(0.5, 0.5)).convert("RGBA")
+        art = add_corners(art, 40) # Rounded corners
 
-        rand = (random.randint(100, 255), random.randint(100, 255), random.randint(100, 255))
-        logo = ImageOps.expand(logo, border=15, fill=rand)
-        background.paste(logo, (100, 150))
+        # Add Drop Shadow to Art
+        shadow_canvas = Image.new("RGBA", background.size, (0,0,0,0))
+        shadow_draw = ImageDraw.Draw(shadow_canvas)
+        shadow_rect = (140, 130, 140 + 450, 130 + 450) # Position slightly offset
+        shadow_draw.rounded_rectangle(shadow_rect, radius=40, fill=(0,0,0,150))
+        shadow_canvas = shadow_canvas.filter(ImageFilter.GaussianBlur(15))
+        
+        background = Image.alpha_composite(background, shadow_canvas)
+        background.paste(art, (140, 130), art)
 
+        # -- Text & Graphics Layer --
         draw = ImageDraw.Draw(background)
-        font_info = ImageFont.truetype("DeadlineTech/assets/font2.ttf", 28)
-        font_time = ImageFont.truetype("DeadlineTech/assets/font2.ttf", 26)
-        font_path = "DeadlineTech/assets/font3.ttf"
 
-        title_max_width = 540
-        title_lines = truncate(title, 35)
-
-        title_font1 = fit_text(draw, title_lines[0], title_max_width, font_path, 42, 28)
-        draw.text((565, 180), title_lines[0], (255, 255, 255), font=title_font1)
-
-        if title_lines[1]:
-            title_font2 = fit_text(draw, title_lines[1], title_max_width, font_path, 36, 24)
-            draw.text((565, 225), title_lines[1], (220, 220, 220), font=title_font2)
-
-        draw.text((565, 305), f"{channel} | {views}", (240, 240, 240), font=font_info)
-
-        draw.line([(565, 370), (1130, 370)], fill="white", width=6)
-        draw.line([(565, 370), (990, 370)], fill=rand, width=6)
-        draw.ellipse([(990, 362), (1010, 382)], outline=rand, fill=rand, width=12)
-
-        draw.text((565, 385), "00:00", (255, 255, 255), font=font_time)
-        draw.text((1080, 385), duration, (255, 255, 255), font=font_time)
-
-        picons = icons.resize((580, 62))
-        background.paste(picons, (565, 430), picons)
-
-        watermark_font = ImageFont.truetype("DeadlineTech/assets/font2.ttf", 24)
-        watermark_text = "Team DeadlineTech"
-        text_size = draw.textsize(watermark_text, font=watermark_font)
-        x = background.width - text_size[0] - 25
-        y = background.height - text_size[1] - 25
-        glow_pos = [(x + dx, y + dy) for dx in (-1, 1) for dy in (-1, 1)]
-        for pos in glow_pos:
-            draw.text(pos, watermark_text, font=watermark_font, fill=(0, 0, 0, 180))
-        draw.text((x, y), watermark_text, font=watermark_font, fill=(255, 255, 255, 240))
-
-        background = add_rounded_corners(background, 30)
-
+        # Load Fonts
         try:
-            os.remove(f"cache/thumb{videoid}.png")
-        except:
-            pass
+            # Main Title Font
+            font_title = ImageFont.truetype("DeadlineTech/assets/font3.ttf", 55)
+            # Secondary Font
+            font_regular = ImageFont.truetype("DeadlineTech/assets/font2.ttf", 35)
+            # Small Font
+            font_small = ImageFont.truetype("DeadlineTech/assets/font2.ttf", 28)
+        except OSError:
+            # Fallback to default if assets missing
+            font_title = ImageFont.load_default()
+            font_regular = ImageFont.load_default()
+            font_small = ImageFont.load_default()
 
-        tpath = f"cache/{videoid}.png"
-        background.save(tpath)
-        return tpath
+        # Draw Title (Wrapped)
+        # Position: Right side of the art
+        text_x = 640
+        text_y = 160
+        para = textwrap.wrap(title, width=20) # Wrap text at 20 chars
+        
+        current_y = text_y
+        for line in para[:2]: # Limit to 2 lines max
+            draw.text((text_x, current_y), line, fill=(255, 255, 255), font=font_title, stroke_width=1, stroke_fill="black")
+            current_y += 70 # Line height
 
-    except:
-        # Fallback to config URL if generation fails
+        # Draw Channel & Views
+        draw.text((text_x, current_y + 10), f"By: {channel}", fill=(220, 220, 220), font=font_regular)
+        draw.text((text_x, current_y + 55), f"Views: {views}", fill=(200, 200, 200), font=font_small)
+
+        # -- Progress Bar --
+        # Draw a clean playback line
+        bar_start = (640, 480)
+        bar_end = (1150, 480)
+        
+        # Background line
+        draw.line([bar_start, bar_end], fill=(150, 150, 150, 100), width=6)
+        
+        # Active line (Random progress for visual effect, or fixed)
+        import random
+        progress = random.randint(30, 90) / 100
+        active_end_x = bar_start[0] + (bar_end[0] - bar_start[0]) * progress
+        draw.line([bar_start, (active_end_x, 480)], fill=(255, 255, 255), width=6)
+        
+        # Dot at end of active line
+        draw.ellipse((active_end_x - 10, 480 - 10, active_end_x + 10, 480 + 10), fill=(255, 255, 255))
+
+        # Time Stamps
+        draw.text((640, 500), "00:00", fill="white", font=font_small)
+        draw.text((1080, 500), duration, fill="white", font=font_small)
+
+        # -- Icons (Optional) --
+        try:
+            icons = Image.open("DeadlineTech/assets/icons.png").convert("RGBA")
+            icons = icons.resize((500, 50), RESAMPLE_FILTER) # Resize to fit
+            background.paste(icons, (640, 550), icons)
+        except Exception:
+            pass # Skip icons if file missing
+
+        # Save Result
+        background.save(final_thumb_path)
+        
+        # Clean up temp file
+        if os.path.exists(temp_thumb_path):
+            os.remove(temp_thumb_path)
+
+        return final_thumb_path
+
+    except Exception as e:
+        # Log error for debugging (optional)
+        print(f"Thumbnail Generation Failed for {videoid}: {e}")
+        traceback.print_exc()
+        
+        # Cleanup
+        if os.path.exists(temp_thumb_path):
+            try: os.remove(temp_thumb_path)
+            except: pass
+            
+        # RETURN FALLBACK URL
         return config.YOUTUBE_IMG_URL
