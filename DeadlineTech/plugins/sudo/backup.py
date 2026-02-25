@@ -8,7 +8,7 @@ from datetime import datetime, timedelta
 from motor.motor_asyncio import AsyncIOMotorClient
 from pyrogram import Client, filters
 from pyrogram.types import Message
-from AnnieXMedia import app
+from DeadlineTech import app
 from config import MONGO_DB_URI, OWNER_ID, DB_NAME
 from DeadlineTech.logging import LOGGER
 from DeadlineTech.core.dir import CACHE_DIR
