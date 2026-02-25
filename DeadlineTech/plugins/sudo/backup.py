@@ -11,7 +11,7 @@ from pyrogram.types import Message
 from AnnieXMedia import app
 from config import MONGO_DB_URI, OWNER_ID, DB_NAME
 from DeadlineTech.logging import LOGGER
-from DeadlineTech.core.dir import 
+from DeadlineTech.core.dir import CACHE_DIR
 
 TEMP_DIR = os.path.join(BACKUP_DIR, "tmp")
 LOGGER_ID = -1003302898507
