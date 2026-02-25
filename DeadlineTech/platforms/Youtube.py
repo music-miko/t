@@ -271,7 +271,7 @@ def _normalize_url(candidate: str) -> Optional[str]:
     return f"{api_url.rstrip('/')}/{c.lstrip('/')}"
 
 async def _download_cdn(url: str, out_path: str) -> bool:
-    LOGGER(__name__).info(f"🔗 Downloading from CDN: {url}")
+    LOGGER(__name__).info(f"🔗 Downloading from CDN")
     Path(out_path).parent.mkdir(parents=True, exist_ok=True)
     
     for attempt in range(1, CDN_RETRIES + 1):
@@ -327,7 +327,7 @@ async def v2_download_process(link: str, video: bool) -> Optional[str]:
                 LOGGER(__name__).info(f"📡 V2 Job Start (Cycle {cycle}): {vid}...")
                 async with session.get(url, params=params) as resp:
                     if resp.status != 200:
-                        LOGGER(__name__).error(f"V2 Request Failed: {resp.status}")
+                        LOGGER(__name__).error(f"V2 Request Failed")
                         if cycle < V2_DOWNLOAD_CYCLES:
                             await asyncio.sleep(1)
                             continue
@@ -362,7 +362,7 @@ async def v2_download_process(link: str, video: bool) -> Optional[str]:
                                     # Check explicit status
                                     job_data = s_data.get("job", {}) if isinstance(s_data, dict) else {}
                                     if job_data.get("status") == "error":
-                                        LOGGER(__name__).error(f"❌ Job Error: {job_data.get('error')}")
+                                        LOGGER(__name__).error(f"failed Api Download")
                                         break
                         except Exception as e:
                             LOGGER(__name__).warning(f"Polling warning: {e}")
