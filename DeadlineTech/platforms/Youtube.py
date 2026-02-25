@@ -3,14 +3,14 @@ import os
 import re
 import time
 import uuid
-import contextlib
+import random
 import logging
 import aiohttp
 import aiofiles
+import yt_dlp
 
 from pathlib import Path
 from typing import Union, Optional, Dict, Any, List
-from urllib.parse import urlparse
 
 from motor.motor_asyncio import AsyncIOMotorClient
 from aiohttp import TCPConnector
@@ -19,7 +19,8 @@ from pyrogram.types import Message
 from pyrogram.enums import MessageEntityType
 from pyrogram.errors import FloodWait
 
-from youtubesearchpython.__future__ import VideosSearch
+# --- NEW LIBRARY ---
+from py_yt import VideosSearch, Playlist
 
 from DeadlineTech import app as TG_APP
 from DeadlineTech.utils.database import is_on_off
@@ -35,7 +36,7 @@ DB_URI = config.DB_URI
 MEDIA_DB_NAME = "arcapi"
 MEDIA_COLLECTION_NAME = "medias"
 
-# Settings from downloader.py
+# Settings
 CHUNK_SIZE = 1024 * 1024
 V2_HTTP_RETRIES = 5
 V2_DOWNLOAD_CYCLES = 5
@@ -46,7 +47,7 @@ JOB_POLL_BACKOFF = 1.2
 NO_CANDIDATE_WAIT = 4
 CDN_RETRIES = 5
 CDN_RETRY_DELAY = 2
-HARD_TIMEOUT = 80
+HARD_TIMEOUT = 300  
 TG_FLOOD_COOLDOWN = 0.0
 
 # Regex
@@ -70,9 +71,8 @@ LOGGER = logging.getLogger("YouTubeAPI")
 # === Statistics System ===
 DOWNLOAD_STATS: Dict[str, int] = {
     "total": 0, "success": 0, "failed": 0,
-    "media_db_hit": 0, "media_db_miss": 0, "media_db_fail": 0,
-    "api_fail_5xx": 0, "network_fail": 0, "timeout_fail": 0,
-    "blocked_unsafe": 0
+    "media_db_hit": 0, "v2_success": 0, "cookie_success": 0,
+    "api_fail_5xx": 0, "network_fail": 0, "timeout_fail": 0
 }
 
 def _inc(key: str):
@@ -87,7 +87,6 @@ class V2HardAPIError(Exception):
 # === Helpers ===
 
 def extract_video_id(link: str) -> str:
-    """Fast local string parsing."""
     if not link: return ""
     s = link.strip()
     if YOUTUBE_ID_RE.match(s): return s
@@ -99,6 +98,12 @@ def extract_video_id(link: str) -> str:
         if YOUTUBE_ID_RE.match(last): return last
     except: pass
     return ""
+
+def cookie_txt_file():
+    cookie_dir = f"{os.getcwd()}/cookies"
+    if not os.path.exists(cookie_dir): return None
+    files = [f for f in os.listdir(cookie_dir) if f.endswith(".txt")]
+    return os.path.join(cookie_dir, random.choice(files)) if files else None
 
 def _ensure_dir(p: str) -> None:
     os.makedirs(p, exist_ok=True)
@@ -159,12 +164,9 @@ async def _download_from_media_db(track_id: str, is_video: bool) -> Optional[str
     global TG_FLOOD_COOLDOWN
     if not track_id or not TG_APP or not MEDIA_CHANNEL_ID: return None
 
-    if time.time() < TG_FLOOD_COOLDOWN: 
-        return None 
+    if time.time() < TG_FLOOD_COOLDOWN: return None 
 
     ext = "mp4" if is_video else "mp3"
-    
-    # Try multiple key formats
     msg_id = None
     keys = [f"{track_id}.{ext}", track_id, f"{track_id}_{'v' if is_video else 'a'}"]
     
@@ -173,11 +175,9 @@ async def _download_from_media_db(track_id: str, is_video: bool) -> Optional[str
             msg_id = await get_media_id(k, isVideo=is_video)
             break
             
-    if not msg_id:
-        _inc("media_db_miss")
-        return None
+    if not msg_id: return None
 
-    LOGGER.info(f"📂 Database HIT: Found {track_id} in cache. Downloading from Telegram...")
+    LOGGER.info(f"📂 Database HIT: {track_id}")
     _inc("media_db_hit")
     out_dir = str(Path(DOWNLOAD_DIR))
     _ensure_dir(out_dir)
@@ -202,15 +202,13 @@ async def _download_from_media_db(track_id: str, is_video: bool) -> Optional[str
             if fixed != final_path:
                 try: os.replace(fixed, final_path)
                 except: final_path = fixed
-            LOGGER.info(f"✅ Database Download Success: {final_path}")
             return final_path
             
     except FloodWait as e:
         TG_FLOOD_COOLDOWN = time.time() + e.value + 5
-        LOGGER.warning(f"⚠️ Telegram FloodWait: Sleeping for {e.value}s")
-    except Exception as e:
-        LOGGER.error(f"❌ Database Download Failed: {e}")
-        _inc("media_db_fail")
+        LOGGER.warning(f"⚠️ FloodWait: {e.value}s")
+    except Exception:
+        pass
     
     return None
 
@@ -245,13 +243,12 @@ def _normalize_candidate_to_url(candidate: str) -> Optional[str]:
 async def _download_from_cdn(cdn_url: str, out_path: str) -> Optional[str]:
     if not cdn_url: return None
     
-    LOGGER.info(f"⬇️ CDN Download started: {out_path}")
+    LOGGER.info(f"⬇️ CDN Download: {out_path}")
     for attempt in range(1, CDN_RETRIES + 1):
         try:
             session = await get_http_session()
             async with session.get(cdn_url, timeout=HARD_TIMEOUT) as resp:
                 if resp.status != 200:
-                    LOGGER.warning(f"⚠️ CDN HTTP {resp.status} (Attempt {attempt}/{CDN_RETRIES})")
                     if attempt < CDN_RETRIES:
                         await asyncio.sleep(CDN_RETRY_DELAY)
                         continue
@@ -264,10 +261,8 @@ async def _download_from_cdn(cdn_url: str, out_path: str) -> Optional[str]:
                         await f.write(chunk)
             
             if os.path.exists(out_path) and os.path.getsize(out_path) > 0:
-                LOGGER.info(f"✅ CDN Download Complete: {out_path}")
                 return out_path
-        except Exception as e:
-            LOGGER.error(f"❌ CDN Network Fail: {e}")
+        except Exception:
             _inc("network_fail")
             if attempt < CDN_RETRIES: await asyncio.sleep(CDN_RETRY_DELAY)
     return None
@@ -286,11 +281,8 @@ async def _v2_request_json(endpoint: str, params: Dict[str, Any]) -> Optional[An
                 if 200 <= resp.status < 300:
                     try: return await resp.json()
                     except: return None
-                if resp.status in (401, 403): 
-                    LOGGER.critical(f"⛔ API Auth Error: {resp.status}")
-                    raise V2HardAPIError(resp.status)
+                if resp.status in (401, 403): raise V2HardAPIError(resp.status)
                 if resp.status >= 500: _inc("api_fail_5xx")
-                else: _inc("network_fail")
         except V2HardAPIError: raise
         except Exception: _inc("network_fail")
         
@@ -306,7 +298,7 @@ async def v2_download_process(link: str, video: bool) -> Optional[str]:
     
     if os.path.exists(out_path): return out_path
 
-    LOGGER.info(f"🔄 Starting V2 API Process for: {query}")
+    LOGGER.info(f"🔄 V2 API Process: {query}")
 
     for cycle in range(1, V2_DOWNLOAD_CYCLES + 1):
         try:
@@ -323,7 +315,6 @@ async def v2_download_process(link: str, video: bool) -> Optional[str]:
         job_id = resp.get("job_id") if isinstance(resp, dict) else None
         
         if job_id and not candidate:
-            LOGGER.info(f"⏳ Job queued (ID: {job_id}), polling status...")
             interval = JOB_POLL_INTERVAL
             for _ in range(JOB_POLL_ATTEMPTS):
                 await asyncio.sleep(interval)
@@ -341,7 +332,6 @@ async def v2_download_process(link: str, video: bool) -> Optional[str]:
             path = await _download_from_cdn(final_url, out_path)
             if path: return path
 
-    LOGGER.error(f"❌ V2 Process Failed after {V2_DOWNLOAD_CYCLES} cycles.")
     return None
 
 # === De-duplication ===
@@ -349,7 +339,7 @@ async def v2_download_process(link: str, video: bool) -> Optional[str]:
 async def deduplicate_download(key: str, runner):
     async with _inflight_lock:
         if fut := _inflight.get(key):
-            LOGGER.info(f"🔗 Joining existing download for: {key}")
+            LOGGER.info(f"🔗 Joining download: {key}")
             return await fut
         fut = asyncio.get_running_loop().create_future()
         _inflight[key] = fut
@@ -358,7 +348,6 @@ async def deduplicate_download(key: str, runner):
         if not fut.done(): fut.set_result(result)
         return result
     except Exception as e:
-        LOGGER.error(f"💥 Exception in download runner: {e}")
         if not fut.done(): fut.set_exception(e)
         return None
     finally:
@@ -374,39 +363,8 @@ class YouTubeAPI:
         self.regex = r"(?:youtube\.com|youtu\.be)"
         self.listbase = "https://youtube.com/playlist?list="
 
-    # === SECURITY CHECK (SMART VERSION) ===
-    def is_safe_input(self, text: str) -> bool:
-        """
-        Validates input to prevent Shell Injection.
-        1. Blocks shell metacharacters (;, |, $, etc.)
-        2. If input is a URL (starts with http), forces it to be a YouTube domain.
-        3. If input is just text (song name), it is ALLOWED.
-        """
-        if not text: return False
-        
-        # 1. Always Block Shell Injection Chars
-        if any(x in text for x in [";", "|", "$", "`", "\n", "\r"]):
-            _inc("blocked_unsafe")
-            LOGGER.warning(f"🛡️ Blocked Shell Injection Attempt: {text}")
-            return False
-
-        # 2. Domain Check (Only if it looks like a URL)
-        if text.startswith(("http://", "https://")):
-            try:
-                p = urlparse(text)
-                allowed = ("youtube.com", "www.youtube.com", "m.youtube.com", "youtu.be")
-                if not any(domain in p.netloc for domain in allowed):
-                    LOGGER.warning(f"🛡️ Blocked Non-YouTube URL: {text}")
-                    return False
-            except:
-                return False
-        
-        return True
-    # ======================================
-
     async def exists(self, link: str, videoid: Union[bool, str] = None):
         if videoid: link = self.base + link
-        if not self.is_safe_input(link): return False
         return bool(re.search(self.regex, link))
 
     async def url(self, message: Message) -> Union[str, None]:
@@ -418,32 +376,26 @@ class YouTubeAPI:
             if msg.entities:
                 for entity in msg.entities:
                     if entity.type == MessageEntityType.URL:
-                        u = text[entity.offset:entity.offset+entity.length]
-                        if self.is_safe_input(u): return u
+                        return text[entity.offset:entity.offset+entity.length]
             if msg.caption_entities:
                 for entity in msg.caption_entities:
                     if entity.type == MessageEntityType.TEXT_LINK:
-                        if self.is_safe_input(entity.url): return entity.url
+                        return entity.url
         return None
 
     async def details(self, link: str, videoid: Union[bool, str] = None):
         if videoid: link = self.base + link
-        if not self.is_safe_input(link): return None
-        
         if "&" in link: link = link.split("&")[0]
         try:
             results = VideosSearch(link, limit=1)
             for r in (await results.next())["result"]:
                 sec = int(time_to_seconds(r["duration"])) if r["duration"] else 0
                 return r["title"], r["duration"], sec, r["thumbnails"][0]["url"].split("?")[0], r["id"]
-        except Exception as e:
-            LOGGER.error(f"❌ Details fetch failed for {link}: {e}")
+        except: pass
         return None
 
     async def title(self, link: str, videoid: Union[bool, str] = None):
         if videoid: link = self.base + link
-        if not self.is_safe_input(link): return ""
-        
         try:
             results = VideosSearch(link, limit=1)
             for r in (await results.next())["result"]: return r["title"]
@@ -452,8 +404,6 @@ class YouTubeAPI:
 
     async def duration(self, link: str, videoid: Union[bool, str] = None):
         if videoid: link = self.base + link
-        if not self.is_safe_input(link): return "00:00"
-        
         try:
             results = VideosSearch(link, limit=1)
             for r in (await results.next())["result"]: return r["duration"]
@@ -462,8 +412,6 @@ class YouTubeAPI:
 
     async def thumbnail(self, link: str, videoid: Union[bool, str] = None):
         if videoid: link = self.base + link
-        if not self.is_safe_input(link): return ""
-        
         try:
             results = VideosSearch(link, limit=1)
             for r in (await results.next())["result"]: return r["thumbnails"][0]["url"].split("?")[0]
@@ -472,28 +420,20 @@ class YouTubeAPI:
 
     async def track(self, link: str, videoid: Union[bool, str] = None):
         if videoid: link = self.base + link
-        if not self.is_safe_input(link): return None, None
-        
         try:
             results = VideosSearch(link, limit=1)
             res_list = (await results.next())["result"]
             if not res_list: return None, None
-            
             for r in res_list:
                 return {
                     "title": r["title"], "link": r["link"], "vidid": r["id"],
                     "duration_min": r["duration"], "thumb": r["thumbnails"][0]["url"].split("?")[0],
                 }, r["id"]
-        except Exception as e:
-            LOGGER.error(f"❌ Track search error: {e}")
-            return None, None
-            
+        except: pass
         return None, None
 
     async def slider(self, link: str, query_type: int, videoid: Union[bool, str] = None):
         if videoid: link = self.base + link
-        if not self.is_safe_input(link): return None
-        
         try:
             a = VideosSearch(link, limit=10)
             result = (await a.next()).get("result")
@@ -502,27 +442,89 @@ class YouTubeAPI:
             return r["title"], r["duration"], r["thumbnails"][0]["url"].split("?")[0], r["id"]
         except: return None
 
-    # === NEW: Replaced Video Method ===
+    # === PLAYLIST METHOD USING PY_YT ===
+    async def playlist(self, link, limit, user_id, videoid: Union[bool, str] = None):
+        if videoid: link = self.listbase + link
+        try:
+            plist = await Playlist.get(link)
+        except:
+            return []
+            
+        videos = plist.get("videos") or []
+        ids: list[str] = []
+        for data in videos[:limit]:
+            if not data:
+                continue
+            vid = data.get("id")
+            if not vid:
+                continue
+            ids.append(vid)
+        return ids
+
+    # === VIDEO METHOD (Includes Fallback) ===
     async def video(self, link: str, videoid: Union[bool, str] = None):
         if videoid: link = self.base + link
-        if not self.is_safe_input(link): return 0, "Invalid or Unsafe Input"
 
-        LOGGER.info(f"📹 Video Download Requested: {link}")
+        LOGGER.info(f"📹 Video Req: {link}")
 
         async def _run():
             vid = extract_video_id(link)
+            
+            # 1. DB
             if vid:
                 db_path = await _download_from_media_db(vid, is_video=True)
-                if db_path: return db_path
-            return await v2_download_process(link, video=True)
+                if db_path: return 1, db_path
+            
+            # 2. V2 API
+            path = await v2_download_process(link, video=True)
+            if path: 
+                _inc("v2_success")
+                return 1, path
+            
+            # 3. Cookie Fallback (Safety Logic)
+            LOGGER.info("🍪 Fallback: Using yt-dlp cookies")
+            cookie_file = cookie_txt_file()
+            if not cookie_file: return 0, "No cookies/API failed"
+            
+            cmd = ["yt-dlp", "--cookies", cookie_file, "-g", "-f", "best[height<=?720]", "--", link]
+            try:
+                # SAFE: subprocess_exec prevents command injection completely
+                proc = await asyncio.create_subprocess_exec(
+                    *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+                )
+                stdout, stderr = await proc.communicate()
+                if stdout: 
+                    _inc("cookie_success")
+                    return 1, stdout.decode().split("\n")[0]
+            except Exception as e:
+                LOGGER.error(f"Fallback error: {e}")
+
+            return 0, "Failed"
 
         key = f"video:{link}"
-        path = await deduplicate_download(key, _run)
-        
-        if path: return 1, path
-        return 0, "Failed"
+        return await deduplicate_download(key, _run)
 
-    # === NEW: Replaced Download Method (The Core) ===
+    async def formats(self, link: str, videoid: Union[bool, str] = None):
+        if videoid: link = self.base + link
+        cookie_file = cookie_txt_file()
+        if not cookie_file: return [], link
+        
+        ytdl_opts = {"quiet": True, "cookiefile": cookie_file}
+        out = []
+        try:
+            with yt_dlp.YoutubeDL(ytdl_opts) as ydl:
+                r = ydl.extract_info(link, download=False)
+                for f in r.get("formats", []):
+                    if "dash" in str(f.get("format")).lower(): continue
+                    out.append({
+                        "format": f.get("format"), "filesize": f.get("filesize"),
+                        "format_id": f.get("format_id"), "ext": f.get("ext"),
+                        "format_note": f.get("format_note"), "yturl": link
+                    })
+        except: pass
+        return out, link
+
+    # === DOWNLOAD METHOD (Includes Fallback) ===
     async def download(
         self,
         link: str,
@@ -536,14 +538,13 @@ class YouTubeAPI:
     ) -> str:
         _inc("total")
         if videoid: link = self.base + link
-        if not self.is_safe_input(link): return None, None
         
         is_vid = True if (video or songvideo) else False
         vid = extract_video_id(link)
         dedup_id = vid or link
         key = f"{'video' if is_vid else 'audio'}:{dedup_id}"
         
-        LOGGER.info(f"📥 Download Request: {dedup_id} (Video={is_vid})")
+        LOGGER.info(f"📥 Download Req: {dedup_id} (Video={is_vid})")
 
         async def _download_logic():
             # 1. DB Check
@@ -557,12 +558,41 @@ class YouTubeAPI:
             path = await v2_download_process(link, video=is_vid)
             if path:
                 _inc("success")
+                _inc("v2_success")
                 return path
             
+            # 3. Cookie Fallback
+            LOGGER.info("🍪 Fallback: Downloading via yt-dlp cookies")
+            cookie_file = cookie_txt_file()
+            if not cookie_file:
+                _inc("failed")
+                return None
+            
+            loop = asyncio.get_running_loop()
+            def _legacy_dl():
+                # SAFE: using yt_dlp's native Python API avoids shell command injection
+                opts = {
+                    "format": "bestaudio/best" if not is_vid else "(bestvideo+bestaudio)",
+                    "outtmpl": "downloads/%(id)s.%(ext)s", "quiet": True, 
+                    "cookiefile": cookie_file, "no_warnings": True
+                }
+                with yt_dlp.YoutubeDL(opts) as ydl:
+                    info = ydl.extract_info(link, download=True)
+                    return os.path.join("downloads", f"{info['id']}.{info['ext']}")
+
+            try:
+                path = await loop.run_in_executor(None, _legacy_dl)
+                if path and os.path.exists(path):
+                    _inc("success")
+                    _inc("cookie_success")
+                    return path
+            except Exception as e:
+                LOGGER.error(f"Fallback failed: {e}")
+
             _inc("failed")
             return None
 
-        # Execute with deduplication and Hard Timeout
+        # Execute
         try:
             path = await asyncio.wait_for(
                 deduplicate_download(key, _download_logic), 
@@ -571,6 +601,6 @@ class YouTubeAPI:
             if path: return path, True
         except Exception as e:
             _inc("timeout_fail")
-            LOGGER.error(f"❌ Download Timed Out/Error: {e}")
+            LOGGER.error(f"❌ Timed Out: {e}")
 
         return None, None
