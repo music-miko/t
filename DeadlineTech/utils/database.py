@@ -666,3 +666,68 @@ async def remove_banned_user(user_id: int):
     if not is_gbanned:
         return
     return await blockeddb.delete_one({"user_id": user_id})
+
+
+async def update_bot_stats(action: str):
+    """
+    Updates Daily, Weekly, Monthly, and Yearly stats in MongoDB.
+    action: 'joined' or 'left'
+    """
+    now = datetime.now()
+    
+    # 1. Daily Stats
+    day_key = now.strftime("%Y-%m-%d")
+    await statsdb.update_one(
+        {"type": "daily", "date": day_key},
+        {"$inc": {action: 1}},
+        upsert=True
+    )
+
+    # 2. Weekly Stats
+    week_key = now.strftime("%Y-%W")
+    await statsdb.update_one(
+        {"type": "weekly", "date": week_key},
+        {"$inc": {action: 1}},
+        upsert=True
+    )
+
+    # 3. Monthly Stats
+    month_key = now.strftime("%Y-%m")
+    await statsdb.update_one(
+        {"type": "monthly", "date": month_key},
+        {"$inc": {action: 1}},
+        upsert=True
+    )
+
+    # 4. Yearly Stats (For 2026, 2027, etc.)
+    year_key = now.strftime("%Y")
+    await statsdb.update_one(
+        {"type": "yearly", "date": year_key},
+        {"$inc": {action: 1}},
+        upsert=True
+    )
+
+async def get_bot_stats():
+    """
+    Fetches stats for the current Day, Week, Month, and Year.
+    Also attempts to fetch Previous Year data if available.
+    """
+    now = datetime.now()
+    current_year = now.strftime("%Y")
+    last_year = str(int(current_year) - 1)
+
+    daily = await statsdb.find_one({"type": "daily", "date": now.strftime("%Y-%m-%d")}) or {}
+    weekly = await statsdb.find_one({"type": "weekly", "date": now.strftime("%Y-%W")}) or {}
+    monthly = await statsdb.find_one({"type": "monthly", "date": now.strftime("%Y-%m")}) or {}
+    yearly = await statsdb.find_one({"type": "yearly", "date": current_year}) or {}
+    last_yearly = await statsdb.find_one({"type": "yearly", "date": last_year}) or {}
+
+    return {
+        "daily": daily,
+        "weekly": weekly,
+        "monthly": monthly,
+        "yearly": yearly,
+        "last_yearly": last_yearly,
+        "current_year": current_year,
+        "last_year": last_year
+    }
