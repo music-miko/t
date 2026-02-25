@@ -4,13 +4,12 @@ import re
 import json
 import uuid
 import random
-import logging
 import time
 import aiohttp
 import aiofiles
 import yt_dlp
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import urlparse, unquote
 from typing import Union, Optional, Dict, Any, List
 from motor.motor_asyncio import AsyncIOMotorClient
 
@@ -19,21 +18,34 @@ from pyrogram.types import Message
 from pyrogram.enums import MessageEntityType
 from pyrogram.errors import FloodWait
 
+# Search & Utils
 from youtubesearchpython.__future__ import VideosSearch
 from DeadlineTech import app as TG_APP
 from DeadlineTech.utils.database import is_on_off
 from DeadlineTech.utils.formatters import time_to_seconds
+from DeadlineTech.logging import LOGGER
 import config
 
 # === Configuration & Constants ===
 YOUTUBE_ID_RE = re.compile(r"^[a-zA-Z0-9_-]{11}$")
 CHUNK_SIZE = 1024 * 1024
 
-# Polling Settings (Like downloader.py)
+# Security Constants
+DANGEROUS_CHARS = [
+    ";", "|", "$", "`", "\n", "\r", 
+    "&", "(", ")", "<", ">", "{", "}", 
+    "\\", "'", '"'
+]
+ALLOWED_DOMAINS = {
+    "youtube.com", "www.youtube.com", "m.youtube.com", 
+    "youtu.be", "music.youtube.com"
+}
+
+# Polling Settings (Synced)
 JOB_POLL_ATTEMPTS = 10     # How many times to check status
 JOB_POLL_INTERVAL = 2.0    # Seconds between checks
 JOB_POLL_BACKOFF = 1.1     # Increase interval slightly each time
-HARD_TIMEOUT = 60         # 5 Minutes Max Total
+HARD_TIMEOUT = 60          # 5 Minutes Max Total
 TG_FLOOD_COOLDOWN = 0.0
 
 # === Database Config ===
@@ -115,7 +127,7 @@ async def _download_from_media_db(track_id: str, is_video: bool) -> Optional[str
         return None
 
     _inc("db_hit")
-    print(f"⚡ Media DB Hit: {track_id} (MsgID: {msg_id})")
+    LOGGER(__name__).info(f"⚡ Media DB Hit: {track_id} (MsgID: {msg_id})")
     
     ext = "mp4" if is_video else "mp3"
     out_dir = Path("downloads/video" if is_video else "downloads/audio")
@@ -144,22 +156,55 @@ async def _download_from_media_db(track_id: str, is_video: bool) -> Optional[str
 
     except FloodWait as e:
         TG_FLOOD_COOLDOWN = time.time() + e.value + 10
-        print(f"⚠️ FloodWait: {e.value}s")
+        LOGGER(__name__).warning(f"⚠️ FloodWait: {e.value}s")
     except Exception as e:
-        print(f"❌ DB Download Fail: {e}")
+        LOGGER(__name__).error(f"❌ DB Download Fail: {e}")
         _inc("db_fail")
     
     return None
 
-# === Existing Helpers ===
+# === Existing Helpers (UPDATED SECURITY) ===
 
-def is_safe_url(url: str) -> bool:
+def is_safe_url(text: str) -> bool:
+    """
+    Validates the input.
+    - If it's a URL: Enforces strict domain and character checks.
+    - If it's Text (Search Query): Returns True (Safe).
+    """
+    if not text: return False
+    
+    # 1. Check if it looks like a URL
+    is_url = text.strip().lower().startswith(("http:", "https:", "www."))
+    
+    # 2. If NOT a URL, it's a search query -> Safe
+    if not is_url:
+        return True
+
+    # 3. If it IS a URL -> Strict Validation
     try:
-        p = urlparse(url)
-        if p.scheme not in ("http", "https"): return False
-        allowed = ("youtube.com", "www.youtube.com", "m.youtube.com", "youtu.be", "music.youtube.com")
-        return any(d in p.netloc for d in allowed)
-    except: return False
+        # Normalize
+        target_url = text.strip()
+        if target_url.lower().startswith("www."):
+            target_url = "https://" + target_url
+
+        # Decode to find hidden malicious chars (e.g., %3B)
+        decoded_url = unquote(target_url)
+
+        # Check for Dangerous Characters
+        if any(char in decoded_url for char in DANGEROUS_CHARS):
+            LOGGER(__name__).warning(f"🚫 Blocked URL (Dangerous Chars): {text}")
+            return False
+
+        # Check Domain
+        p = urlparse(target_url)
+        if p.netloc not in ALLOWED_DOMAINS:
+            LOGGER(__name__).warning(f"🚫 Blocked URL (Invalid Domain): {p.netloc}")
+            return False
+            
+        return True
+    except Exception as e:
+        LOGGER(__name__).error(f"URL Parsing Error: {e}")
+        return False
 
 def extract_safe_id(link: str) -> Optional[str]:
     try:
@@ -206,22 +251,24 @@ def _extract_candidate(obj: Any) -> Optional[str]:
     return None
 
 async def _download_cdn(url: str, out_path: str) -> bool:
-    print(f"🔗 Downloading from CDN: {url}")
+    LOGGER(__name__).info(f"🔗 Downloading from CDN: {url}")
     Path(out_path).parent.mkdir(parents=True, exist_ok=True)
-    for i in range(1, 3):
+    for i in range(1, 4): # Retry up to 3 times
         try:
             async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=600)) as session:
                 async with session.get(url) as resp:
                     if resp.status != 200: 
-                        await asyncio.sleep(1)
+                        await asyncio.sleep(1.5)
                         continue
                     async with aiofiles.open(out_path, "wb") as f:
                         async for chunk in resp.content.iter_chunked(CHUNK_SIZE):
                             if not chunk: break
                             await f.write(chunk)
-            if os.path.exists(out_path) and os.path.getsize(out_path) > 0: return True
+            
+            if os.path.exists(out_path) and os.path.getsize(out_path) > 0:
+                return True
         except Exception as e:
-            print(f"CDN Fail: {e}")
+            LOGGER(__name__).error(f"CDN Download Fail (Attempt {i}): {e}")
         await asyncio.sleep(1)
     return False
 
@@ -230,48 +277,59 @@ async def v2_download_process(link: str, video: bool) -> Optional[str]:
     ext = "mp4" if video else "m4a"
     out_path = Path("downloads/video" if video else "downloads/audio") / f"{vid}.{ext}"
 
-    if out_path.exists() and out_path.stat().st_size > 0: return str(out_path)
+    if out_path.exists() and out_path.stat().st_size > 0:
+        return str(out_path)
 
     api_key = getattr(config, "API_KEY", None)
     api_url = getattr(config, "API_URL", None)
-    if not api_url or not api_key: return None
+    if not api_url or not api_key:
+        LOGGER(__name__).error("API Creds Missing")
+        return None
 
     # V2 Logic: Start Job -> Get ID -> Poll
     try:
-        timeout = aiohttp.ClientTimeout(total=20)
+        timeout = aiohttp.ClientTimeout(total=30)
         async with aiohttp.ClientSession(timeout=timeout) as session:
             # 1. Start Job
             url = f"{api_url.rstrip('/')}/youtube/v2/download"
             params = {"query": vid, "isVideo": str(video).lower(), "api_key": api_key}
             
-            print(f"📡 V2 Job Start: {vid}...")
+            LOGGER(__name__).info(f"📡 V2 Job Start: {vid}...")
             async with session.get(url, params=params) as resp:
-                if resp.status != 200: return None
+                if resp.status != 200:
+                    LOGGER(__name__).error(f"V2 Request Failed: {resp.status}")
+                    return None
                 data = await resp.json()
 
             job_id = data.get("job_id")
-            if not job_id: return None
+            if not job_id:
+                LOGGER(__name__).error("V2 No Job ID Returned")
+                return None
 
             # 2. Poll Status
-            print(f"⏳ Polling Job: {job_id}")
+            LOGGER(__name__).info(f"⏳ Polling Job: {job_id}")
             interval = JOB_POLL_INTERVAL
             final_url = None
 
             for _ in range(JOB_POLL_ATTEMPTS):
                 await asyncio.sleep(interval)
                 status_url = f"{api_url.rstrip('/')}/youtube/jobStatus"
-                async with session.get(status_url, params={"job_id": job_id}) as s_resp:
-                    if s_resp.status == 200:
-                        s_data = await s_resp.json()
-                        job_data = s_data.get("job", {})
-                        status = job_data.get("status")
-                        
-                        if status == "done":
-                            final_url = _normalize_url(_extract_candidate(s_data))
-                            break
-                        elif status == "error":
-                            print(f"❌ Job Error: {job_data.get('error')}")
-                            return None
+                
+                try:
+                    async with session.get(status_url, params={"job_id": job_id}) as s_resp:
+                        if s_resp.status == 200:
+                            s_data = await s_resp.json()
+                            job_data = s_data.get("job", {})
+                            status = job_data.get("status")
+                            
+                            if status == "done":
+                                final_url = _normalize_url(_extract_candidate(s_data))
+                                break
+                            elif status == "error":
+                                LOGGER(__name__).error(f"❌ Job Error: {job_data.get('error')}")
+                                return None
+                except Exception as e:
+                    LOGGER(__name__).warning(f"Polling warning: {e}")
                 
                 interval *= JOB_POLL_BACKOFF
             
@@ -279,9 +337,11 @@ async def v2_download_process(link: str, video: bool) -> Optional[str]:
             if final_url:
                 if await _download_cdn(final_url, str(out_path)):
                     return str(out_path)
+            else:
+                 LOGGER(__name__).error("❌ Job Timed Out or No URL found.")
 
     except Exception as e:
-        print(f"V2 Polling Error: {e}")
+        LOGGER(__name__).error(f"V2 Polling Process Error: {e}")
     
     return None
 
@@ -295,6 +355,9 @@ class YouTubeAPI:
 
     async def exists(self, link: str, videoid: Union[bool, str] = None):
         if videoid: link = self.base + link
+        # 'is_safe_url' now allows text but enforces strict URL checks.
+        # For 'exists', we assume 'link' must be a valid URL.
+        # So we check regex matches YouTube pattern AND it passes security.
         return bool(re.search(self.regex, link) and is_safe_url(link))
 
     async def url(self, message: Message) -> Union[str, None]:
@@ -316,7 +379,10 @@ class YouTubeAPI:
     async def details(self, link: str, videoid: Union[bool, str] = None):
         if videoid: link = self.base + link
         if "&" in link: link = link.split("&")[0]
+        
+        # Security Check
         if not is_safe_url(link): return "Unsafe URL", "0", 0, "", ""
+        
         results = VideosSearch(link, limit=1)
         for r in (await results.next())["result"]:
             sec = int(time_to_seconds(r["duration"])) if r["duration"] else 0
@@ -343,6 +409,8 @@ class YouTubeAPI:
 
     async def video(self, link: str, videoid: Union[bool, str] = None):
         if videoid: link = self.base + link
+        
+        # Security Check
         if not is_safe_url(link): return 0, "Unsafe URL"
         
         # 1. DB CHECK
@@ -435,6 +503,8 @@ class YouTubeAPI:
     ) -> str:
         _inc("total")
         if videoid: link = self.base + link
+        
+        # Security: Allow Text Queries, Block Bad URLs
         if not is_safe_url(link):
             _inc("failed")
             return None, None
@@ -485,6 +555,3 @@ class YouTubeAPI:
 
         _inc("failed")
         return None, None
-
-
-
