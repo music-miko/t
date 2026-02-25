@@ -41,12 +41,18 @@ ALLOWED_DOMAINS = {
     "youtu.be", "music.youtube.com"
 }
 
-# Polling Settings (Synced)
+# Polling & Request Settings (Synced with downloader.py)
 JOB_POLL_ATTEMPTS = 10     # How many times to check status
 JOB_POLL_INTERVAL = 2.0    # Seconds between checks
-JOB_POLL_BACKOFF = 1.1     # Increase interval slightly each time
-HARD_TIMEOUT = 60          # 5 Minutes Max Total
+JOB_POLL_BACKOFF = 1.2     # Increase interval slightly each time (1.2 from downloader.py)
+HARD_TIMEOUT = 80          # 80 Seconds Max Total (from downloader.py)
 TG_FLOOD_COOLDOWN = 0.0
+
+V2_HTTP_RETRIES = 5
+V2_DOWNLOAD_CYCLES = 5
+NO_CANDIDATE_WAIT = 4
+CDN_RETRIES = 5
+CDN_RETRY_DELAY = 2
 
 # === Database Config ===
 MEDIA_CHANNEL_ID = config.MEDIA_CHANNEL_ID
@@ -58,7 +64,8 @@ MEDIA_COLLECTION_NAME = getattr(config, "MEDIA_COLLECTION_NAME", "medias")
 DOWNLOAD_STATS: Dict[str, int] = {
     "total": 0, "success": 0, "failed": 0,
     "db_hit": 0, "v2_success": 0, "cookie_success": 0,
-    "db_miss": 0, "db_fail": 0
+    "db_miss": 0, "db_fail": 0, "timeout_fail": 0,
+    "no_candidate": 0, "cdn_fail": 0
 }
 
 def _inc(key: str):
@@ -221,45 +228,62 @@ def cookie_txt_file():
     files = [f for f in os.listdir(cookie_dir) if f.endswith(".txt")]
     return os.path.join(cookie_dir, random.choice(files)) if files else None
 
-# === V2 API with Polling (Logic from downloader.py) ===
+# === V2 API Logic (Migrated from downloader.py) ===
+
+def _looks_like_status_text(s: Optional[str]) -> bool:
+    if not s: return False
+    low = s.lower()
+    return any(x in low for x in ("download started", "background", "jobstatus", "job_id", "processing", "queued"))
+
+def _extract_candidate(obj: Any) -> Optional[str]:
+    if obj is None: return None
+    if isinstance(obj, str):
+        s = obj.strip()
+        return s if s else None
+    if isinstance(obj, list) and obj:
+        return _extract_candidate(obj[0])
+    if isinstance(obj, dict):
+        job = obj.get("job")
+        if isinstance(job, dict):
+            res = job.get("result")
+            if isinstance(res, dict):
+                for k in ("public_url", "cdnurl", "download_url", "url", "tg_link", "telegram_link", "message_link"):
+                    v = res.get(k)
+                    if isinstance(v, str) and v.strip(): return v.strip()
+        for k in ("public_url", "cdnurl", "download_url", "url", "tg_link", "telegram_link", "message_link"):
+            v = obj.get(k)
+            if isinstance(v, str) and v.strip(): return v.strip()
+        for wrap in ("result", "results", "data", "items", "payload", "message"):
+            v = obj.get(wrap)
+            if v:
+                c = _extract_candidate(v)
+                if c: return c
+    return None
 
 def _normalize_url(candidate: str) -> Optional[str]:
     api_url = getattr(config, "API_URL", None)
     if not api_url or not candidate: return None
     c = candidate.strip()
-    # Remove internal server paths
-    if "/root/" in c or "/home/" in c:
-        if "downloads/" in c:
-            clean = c.split("downloads/")[-1]
-            return f"{api_url.rstrip('/')}/media/downloads/{clean}"
-        return None 
-    if c.startswith("http"): return c
+    if c.startswith(("http://", "https://")): return c
+    if c.startswith("/"):
+        if c.startswith("/root") or c.startswith("/home"): return None
+        return f"{api_url.rstrip('/')}{c}"
     return f"{api_url.rstrip('/')}/{c.lstrip('/')}"
-
-def _extract_candidate(obj: Any) -> Optional[str]:
-    if not obj: return None
-    if isinstance(obj, str) and obj.startswith("http"): return obj
-    if isinstance(obj, dict):
-        # Check job result
-        job = obj.get("job")
-        if isinstance(job, dict):
-            res = job.get("result")
-            if isinstance(res, dict):
-                 return res.get("public_url") or res.get("url")
-        # Check direct result
-        return obj.get("public_url") or obj.get("url")
-    return None
 
 async def _download_cdn(url: str, out_path: str) -> bool:
     LOGGER(__name__).info(f"🔗 Downloading from CDN: {url}")
     Path(out_path).parent.mkdir(parents=True, exist_ok=True)
-    for i in range(1, 4): # Retry up to 3 times
+    
+    for attempt in range(1, CDN_RETRIES + 1):
         try:
-            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=600)) as session:
+            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=HARD_TIMEOUT)) as session:
                 async with session.get(url) as resp:
-                    if resp.status != 200: 
-                        await asyncio.sleep(1.5)
-                        continue
+                    if resp.status != 200:
+                        if attempt < CDN_RETRIES:
+                            await asyncio.sleep(CDN_RETRY_DELAY)
+                            continue
+                        return False
+
                     async with aiofiles.open(out_path, "wb") as f:
                         async for chunk in resp.content.iter_chunked(CHUNK_SIZE):
                             if not chunk: break
@@ -267,9 +291,14 @@ async def _download_cdn(url: str, out_path: str) -> bool:
             
             if os.path.exists(out_path) and os.path.getsize(out_path) > 0:
                 return True
+
+        except asyncio.TimeoutError:
+            _inc("timeout_fail")
+            if attempt < CDN_RETRIES: await asyncio.sleep(CDN_RETRY_DELAY)
         except Exception as e:
-            LOGGER(__name__).error(f"CDN Download Fail (Attempt {i}): {e}")
-        await asyncio.sleep(1)
+            LOGGER(__name__).error(f"CDN Fail: {e}")
+            if attempt < CDN_RETRIES: await asyncio.sleep(CDN_RETRY_DELAY)
+    
     return False
 
 async def v2_download_process(link: str, video: bool) -> Optional[str]:
@@ -286,62 +315,85 @@ async def v2_download_process(link: str, video: bool) -> Optional[str]:
         LOGGER(__name__).error("API Creds Missing")
         return None
 
-    # V2 Logic: Start Job -> Get ID -> Poll
-    try:
-        timeout = aiohttp.ClientTimeout(total=30)
-        async with aiohttp.ClientSession(timeout=timeout) as session:
-            # 1. Start Job
-            url = f"{api_url.rstrip('/')}/youtube/v2/download"
-            params = {"query": vid, "isVideo": str(video).lower(), "api_key": api_key}
-            
-            LOGGER(__name__).info(f"📡 V2 Job Start: {vid}...")
-            async with session.get(url, params=params) as resp:
-                if resp.status != 200:
-                    LOGGER(__name__).error(f"V2 Request Failed: {resp.status}")
+    # V2 Retry Cycles (from downloader.py)
+    for cycle in range(1, V2_DOWNLOAD_CYCLES + 1):
+        try:
+            timeout = aiohttp.ClientTimeout(total=30)
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                # 1. Start Job
+                url = f"{api_url.rstrip('/')}/youtube/v2/download"
+                params = {"query": vid, "isVideo": str(video).lower(), "api_key": api_key}
+                
+                LOGGER(__name__).info(f"📡 V2 Job Start (Cycle {cycle}): {vid}...")
+                async with session.get(url, params=params) as resp:
+                    if resp.status != 200:
+                        LOGGER(__name__).error(f"V2 Request Failed: {resp.status}")
+                        if cycle < V2_DOWNLOAD_CYCLES:
+                            await asyncio.sleep(1)
+                            continue
+                        return None
+                    data = await resp.json()
+
+                # 2. Extract Job ID or Immediate Candidate
+                candidate = _extract_candidate(data)
+                if candidate and _looks_like_status_text(candidate):
+                    candidate = None # It's just a status message, not a URL
+
+                job_id = data.get("job_id")
+                if isinstance(data.get("job"), dict):
+                     job_id = data.get("job").get("id")
+
+                # 3. Poll if we have a Job ID but no Candidate yet
+                if job_id and not candidate:
+                    LOGGER(__name__).info(f"⏳ Polling Job: {job_id}")
+                    interval = JOB_POLL_INTERVAL
+                    
+                    for _ in range(JOB_POLL_ATTEMPTS):
+                        await asyncio.sleep(interval)
+                        status_url = f"{api_url.rstrip('/')}/youtube/jobStatus"
+                        try:
+                            async with session.get(status_url, params={"job_id": job_id}) as s_resp:
+                                if s_resp.status == 200:
+                                    s_data = await s_resp.json()
+                                    candidate = _extract_candidate(s_data)
+                                    if candidate and not _looks_like_status_text(candidate):
+                                        break
+                                    
+                                    # Check explicit status
+                                    job_data = s_data.get("job", {}) if isinstance(s_data, dict) else {}
+                                    if job_data.get("status") == "error":
+                                        LOGGER(__name__).error(f"❌ Job Error: {job_data.get('error')}")
+                                        break
+                        except Exception as e:
+                            LOGGER(__name__).warning(f"Polling warning: {e}")
+                        
+                        interval *= JOB_POLL_BACKOFF
+                
+                # 4. Process Candidate
+                if not candidate:
+                    _inc("no_candidate")
+                    if cycle < V2_DOWNLOAD_CYCLES:
+                        await asyncio.sleep(NO_CANDIDATE_WAIT)
+                        continue
                     return None
-                data = await resp.json()
 
-            job_id = data.get("job_id")
-            if not job_id:
-                LOGGER(__name__).error("V2 No Job ID Returned")
-                return None
+                final_url = _normalize_url(candidate)
+                if not final_url:
+                     if cycle < V2_DOWNLOAD_CYCLES:
+                        await asyncio.sleep(NO_CANDIDATE_WAIT)
+                        continue
+                     return None
 
-            # 2. Poll Status
-            LOGGER(__name__).info(f"⏳ Polling Job: {job_id}")
-            interval = JOB_POLL_INTERVAL
-            final_url = None
-
-            for _ in range(JOB_POLL_ATTEMPTS):
-                await asyncio.sleep(interval)
-                status_url = f"{api_url.rstrip('/')}/youtube/jobStatus"
-                
-                try:
-                    async with session.get(status_url, params={"job_id": job_id}) as s_resp:
-                        if s_resp.status == 200:
-                            s_data = await s_resp.json()
-                            job_data = s_data.get("job", {})
-                            status = job_data.get("status")
-                            
-                            if status == "done":
-                                final_url = _normalize_url(_extract_candidate(s_data))
-                                break
-                            elif status == "error":
-                                LOGGER(__name__).error(f"❌ Job Error: {job_data.get('error')}")
-                                return None
-                except Exception as e:
-                    LOGGER(__name__).warning(f"Polling warning: {e}")
-                
-                interval *= JOB_POLL_BACKOFF
-            
-            # 3. Download if success
-            if final_url:
+                # 5. Download
                 if await _download_cdn(final_url, str(out_path)):
                     return str(out_path)
-            else:
-                 LOGGER(__name__).error("❌ Job Timed Out or No URL found.")
-
-    except Exception as e:
-        LOGGER(__name__).error(f"V2 Polling Process Error: {e}")
+                else:
+                    _inc("cdn_fail")
+        
+        except Exception as e:
+            LOGGER(__name__).error(f"V2 Cycle Error: {e}")
+            if cycle < V2_DOWNLOAD_CYCLES:
+                await asyncio.sleep(1)
     
     return None
 
@@ -356,8 +408,6 @@ class YouTubeAPI:
     async def exists(self, link: str, videoid: Union[bool, str] = None):
         if videoid: link = self.base + link
         # 'is_safe_url' now allows text but enforces strict URL checks.
-        # For 'exists', we assume 'link' must be a valid URL.
-        # So we check regex matches YouTube pattern AND it passes security.
         return bool(re.search(self.regex, link) and is_safe_url(link))
 
     async def url(self, message: Message) -> Union[str, None]:
