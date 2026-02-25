@@ -2,6 +2,7 @@
 
 import random
 import string
+import traceback
 
 from pyrogram import filters
 from pyrogram.types import InlineKeyboardMarkup, InputMediaPhoto, Message
@@ -74,14 +75,18 @@ async def play_commnd(
         if message.reply_to_message
         else None
     )
+    
+    # ==========================
+    #  TELEGRAM AUDIO/VIDEO
+    # ==========================
     if audio_telegram:
         if audio_telegram.file_size > 104857600:
             return await mystic.edit_text(_["play_5"])
-        duration_min = seconds_to_min(audio_telegram.duration)
         if (audio_telegram.duration) > config.DURATION_LIMIT:
             return await mystic.edit_text(
                 _["play_6"].format(config.DURATION_LIMIT_MIN, app.mention)
             )
+        
         file_path = await Telegram.get_filepath(audio=audio_telegram)
         if await Telegram.download(_, message, mystic, file_path):
             message_link = await Telegram.get_link(message)
@@ -112,6 +117,7 @@ async def play_commnd(
                 return await mystic.edit_text(err)
             return await mystic.delete()
         return
+
     elif video_telegram:
         if message.reply_to_message.document:
             try:
@@ -126,6 +132,7 @@ async def play_commnd(
                 )
         if video_telegram.file_size > config.TG_VIDEO_FILESIZE_LIMIT:
             return await mystic.edit_text(_["play_8"])
+            
         file_path = await Telegram.get_filepath(video=video_telegram)
         if await Telegram.download(_, message, mystic, file_path):
             message_link = await Telegram.get_link(message)
@@ -156,6 +163,10 @@ async def play_commnd(
                 return await mystic.edit_text(err)
             return await mystic.delete()
         return
+
+    # ==========================
+    #  URL HANDLING
+    # ==========================
     elif url:
         if await YouTube.exists(url):
             if "playlist" in url:
@@ -165,8 +176,12 @@ async def play_commnd(
                         config.PLAYLIST_FETCH_LIMIT,
                         message.from_user.id,
                     )
-                except:
+                except Exception:
                     return await mystic.edit_text(_["play_3"])
+                
+                if not details:
+                     return await mystic.edit_text("🚫 **Error:** Playlist not found or empty.")
+
                 streamtype = "playlist"
                 plist_type = "yt"
                 if "&" in url:
@@ -178,14 +193,20 @@ async def play_commnd(
             else:
                 try:
                     details, track_id = await YouTube.track(url)
-                except:
+                except Exception:
                     return await mystic.edit_text(_["play_3"])
+                
+                # INJECTION/SAFETY BLOCK HANDLER
+                if not details or not track_id:
+                    return await mystic.edit_text("🚫 **Error:** Processing failed.\n\nThe URL might be invalid, unsafe, or geo-restricted.")
+                
                 streamtype = "youtube"
                 img = details["thumb"]
                 cap = _["play_10"].format(
                     details["title"],
                     details["duration_min"],
                 )
+        
         elif await Spotify.valid(url):
             spotify = True
             if not config.SPOTIFY_CLIENT_ID and not config.SPOTIFY_CLIENT_SECRET:
@@ -197,6 +218,10 @@ async def play_commnd(
                     details, track_id = await Spotify.track(url)
                 except:
                     return await mystic.edit_text(_["play_3"])
+                
+                if not details:
+                     return await mystic.edit_text(_["play_3"])
+
                 streamtype = "youtube"
                 img = details["thumb"]
                 cap = _["play_10"].format(details["title"], details["duration_min"])
@@ -229,12 +254,17 @@ async def play_commnd(
                 cap = _["play_11"].format(message.from_user.first_name)
             else:
                 return await mystic.edit_text(_["play_15"])
+        
         elif await Apple.valid(url):
             if "album" in url:
                 try:
                     details, track_id = await Apple.track(url)
                 except:
                     return await mystic.edit_text(_["play_3"])
+                
+                if not details:
+                     return await mystic.edit_text(_["play_3"])
+
                 streamtype = "youtube"
                 img = details["thumb"]
                 cap = _["play_10"].format(details["title"], details["duration_min"])
@@ -250,17 +280,30 @@ async def play_commnd(
                 img = url
             else:
                 return await mystic.edit_text(_["play_3"])
+        
         elif await Resso.valid(url):
             try:
                 details, track_id = await Resso.track(url)
             except:
                 return await mystic.edit_text(_["play_3"])
+            
+            if not details:
+                 return await mystic.edit_text(_["play_3"])
+
             streamtype = "youtube"
             img = details["thumb"]
             cap = _["play_10"].format(details["title"], details["duration_min"])
+        
         elif await SoundCloud.valid(url):
             return await mystic.edit_text("❌ SoundCloud streaming and downloading is currently disabled.")
+        
         else:
+            # DIRECT LINK FALLBACK
+            # Security Check for dangerous characters in Direct URLs
+            dangerous_chars = [";", "|", "$", "`", "\n", "\r", "&", "(", ")", "<", ">", "{", "}"]
+            if any(char in url for char in dangerous_chars):
+                 return await mystic.edit_text("🚫 **Error:** Malicious link detected.\nCommand canceled for security reasons.")
+
             try:
                 await Anony.stream_call(url)
             except NoActiveGroupCall:
@@ -271,6 +314,7 @@ async def play_commnd(
                 )
             except Exception as e:
                 return await mystic.edit_text(_["general_2"].format(type(e).__name__))
+            
             await mystic.edit_text(_["str_2"])
             try:
                 await stream(
@@ -290,6 +334,10 @@ async def play_commnd(
                 err = e if ex_type == "AssistantErr" else _["general_2"].format(ex_type)
                 return await mystic.edit_text(err)
             return await play_logs(message, streamtype="M3u8 or Index Link")
+
+    # ==========================
+    #  SEARCH QUERY HANDLING
+    # ==========================
     else:
         if len(message.command) < 2:
             buttons = botplaylist_markup(_)
@@ -297,16 +345,25 @@ async def play_commnd(
                 _["play_18"],
                 reply_markup=InlineKeyboardMarkup(buttons),
             )
+        
         slider = True
         query = message.text.split(None, 1)[1]
         if "-v" in query:
             query = query.replace("-v", "")
+        
         try:
             details, track_id = await YouTube.track(query)
-        except Exception as ex:
-            print(ex)
+        except Exception:
             return await mystic.edit_text(_["play_3"])
+        
+        if not details or not track_id:
+            return await mystic.edit_text("❌ **No results found.**\nPlease check your spelling or try a different keyword.")
+
         streamtype = "youtube"
+
+    # ==========================
+    #  STREAMING LOGIC
+    # ==========================
     if str(playmode) == "Direct":
         if not plist_type:
             if details["duration_min"]:
@@ -430,10 +487,15 @@ async def play_music(client, CallbackQuery, _):
     mystic = await CallbackQuery.message.reply_text(
         _["play_2"].format(channel) if channel else _["play_1"]
     )
+    
     try:
         details, track_id = await YouTube.track(vidid, True)
-    except:
+    except Exception:
         return await mystic.edit_text(_["play_3"])
+        
+    if not details or not track_id:
+        return await mystic.edit_text("🚫 **Error:** Video unavailable or blocked.")
+
     if details["duration_min"]:
         duration_sec = time_to_seconds(details["duration_min"])
         if duration_sec > config.DURATION_LIMIT:
