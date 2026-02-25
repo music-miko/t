@@ -192,6 +192,3 @@ async def auto_clean():
 
         except Exception as e:
             LOG.warning(f"AutoClean error: {e}")
-#auto clean task
-asyncio.create_task(auto_clean())
-
