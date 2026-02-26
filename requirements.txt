@@ -12,7 +12,7 @@ heroku3
 motor
 pillow==9.5.0
 psutil
-httpx==0.27.2
+httpx>=0.28.1
 py-tgcalls==0.9.7
 pykeyboard
 https://github.com/KurimuzonAkuma/pyrogram/archive/v2.1.23.zip
@@ -27,3 +27,4 @@ git+https://github.com/yt-dlp/yt-dlp.git@master
 youtube-search
 youtube-search-python
 uvloop==0.21.0
+py-yt-search
